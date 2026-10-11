@@ -8,6 +8,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
@@ -26,6 +28,29 @@ jobs:
           chmod a+x ~/repo
           sudo mv ~/repo /usr/local/bin/repo
 
+      - name: Configure git auth for repo
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Debug - verify repo files
+        run: |
+          echo "=== GITHUB_WORKSPACE ==="
+          ls -la "$GITHUB_WORKSPACE"
+          echo ""
+          echo "=== scripts/ ==="
+          ls -la "$GITHUB_WORKSPACE/scripts" || echo "scripts dir NOT FOUND"
+          echo ""
+          echo "=== manifest/ ==="
+          ls -la "$GITHUB_WORKSPACE/manifest" || echo "manifest dir NOT FOUND"
+          echo ""
+          echo "=== apply.sh 前 5 行 ==="
+          head -5 "$GITHUB_WORKSPACE/scripts/apply.sh" || echo "apply.sh NOT FOUND"
+          echo ""
+          echo "=== oneplus_10t.xml 前 10 行 ==="
+          head -10 "$GITHUB_WORKSPACE/manifest/oneplus_10t.xml" || echo "oneplus_10t.xml NOT FOUND"
+
       - name: Init & sync source
         run: |
           mkdir k && cd k
@@ -35,7 +60,9 @@ jobs:
       - name: Apply optimizations (SSG + LRNG + configs)
         run: |
           cd k
-          RUN_BUILD=0 bash $GITHUB_WORKSPACE/scripts/apply.sh
+          cp "$GITHUB_WORKSPACE/scripts/apply.sh" /tmp/apply.sh
+          chmod +x /tmp/apply.sh
+          RUN_BUILD=0 bash /tmp/apply.sh
 
       - name: Build kernel (ThinLTO)
         run: |
@@ -55,3 +82,12 @@ jobs:
         with:
           name: build-log
           path: k/build.log
+          if-no-files-found: warn
+
+      - name: Upload apply.sh log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-log
+          path: /tmp/lrng-ssg-patches/log
+          if-no-files-found: warn
