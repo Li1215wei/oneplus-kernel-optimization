@@ -1,0 +1,57 @@
+name: Build Optimized Kernel
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Install repo tool
+        run: |
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: Init & sync source
+        run: |
+          mkdir k && cd k
+          repo init -u https://github.com/${{ github.repository }}.git -b main -m manifest/oneplus_10t.xml --depth=1
+          repo sync -c -j8
+
+      - name: Apply optimizations (SSG + LRNG + configs)
+        run: |
+          cd k
+          RUN_BUILD=0 bash $GITHUB_WORKSPACE/scripts/apply.sh
+
+      - name: Build kernel (ThinLTO)
+        run: |
+          cd k
+          export LTO=thin
+          ./kernel_platform/oplus/build/oplus_build.sh waipio consolidate thin all 2>&1 | tee build.log
+
+      - name: Verify LTO mode
+        if: always()
+        run: |
+          grep -n "Modifying LTO mode to 'thin'" k/build.log || true
+          find k/out -name '.config' -path '*msm-kernel*' | head -1 | xargs -r grep -E 'CONFIG_(LTO|LRNG|MQ_IOSCHED_SSG|USB_AUTOSUSPEND)' || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: k/build.log
