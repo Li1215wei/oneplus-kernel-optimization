@@ -1,56 +1,47 @@
 #!/usr/bin/env bash
 # =============================================================================
-# apply.sh —— 内核优化补丁应用（双树版 v3）
+# apply.sh —— 内核优化补丁应用（v5）
 #   目标机型: OnePlus Ace Pro (PGP110 / SM8475)
 #   代码基线: android12-5.10 / linux-5.10.236
 #
-# 树映射（v3 相对 v2 的关键修正）:
-#   ┌──────────────┬──────────────────┬─────────────────────────────────────────┐
-#   │ 改动         │ 作用树           │ 原因                                     │
-#   ├──────────────┼──────────────────┼─────────────────────────────────────────┤
-#   │ SSG 调度器   │ common/          │ mixed build 下 Image 由 common 产出；     │
-#   │              │                  │ obj-y 项不会被 make modules 编译，        │
-#   │              │                  │ 放在 msm-kernel 等于没打（BLOCKING-2）    │
-#   │ LRNG         │ common/          │ 同上 + vendor 树 Kconfig 里没有该符号     │
-#   ├──────────────┼──────────────────┼─────────────────────────────────────────┤
-#   │ 内核配置     │ common/arch/arm64/configs/gki_defconfig 末尾               │
-#   │              │ ← v3 修正（BLOCKING-1）：不再写共享的 consolidate.fragment，│
-#   │              │   否则 vendor 趟 defconfig 会因 check_merged_defconfig    │
-#   │              │   报 "did not apply as expected" 而 exit 1                │
-#   ├──────────────┼─────────────────────────────────────────────────────────┤
-#   │ ThinLTO      │ 不改文件，仅构建参数 LTO=thin                             │
-#   └──────────────┴─────────────────────────────────────────────────────────┘
+# 优化项（6 项）:
+#   1. ThinLTO          —— 构建参数 export LTO=thin，不改文件
+#   2. LRNG v59         —— 打入 common/
+#   3. SSG I/O 调度器    —— 打入 common/
+#   4. USB 省电         —— CONFIG_USB_AUTOSUSPEND_DELAY=5
+#   5. 关闭调试选项      —— PART 3.5（删除式，见下）
+#   6. KVM              —— 原仓库已开启（CONFIG_VIRTUALIZATION=y + CONFIG_KVM=y），本脚本不动
+#   ❌ TEO              —— 不改：保持 qcom-cpu-lpm（原厂集群 LPM 感知）
+#
+# ⚠️ 必须用 VARIANT=consolidate（默认值）构建：
+#    - consolidate 的 GKI 趟 POST_DEFCONFIG_CMDS 被 gki_consolidate.aarch64 覆盖为 rm，
+#      不跑 check_defconfig → 配置可自由改动
+#    - VARIANT=gki 会跑 check_defconfig，且 build/build.sh:357 有全局 set -e
+#      → 配置与 savedefconfig 不一致时构建直接中止
+#
+# ⚠️ PART 3.5 为什么用「删除行」而不是「# CONFIG_X is not set」：
+#    - 写 "not set" 会让子选项（如 DEBUG_KMEMLEAK_MEM_POOL_SIZE、KASAN_HW_TAGS、
+#      *_KUNIT_TEST）变成"不可见符号" → 从 .config 消失 → 但仍在合并后的 defconfig 里
+#      → vendor 趟 check_merged_defconfig 输出 "-符号" → exit 1 → 构建中止
+#    - 删除行则只会在 .config 侧多出 "+符号"（允许），不会触发该守卫
+#    已实测：删除后 fragment 100→61 行、两个 gki_defconfig 各删 15 行，均无孤儿符号
 #
 # 用法（在 repo/ROM 根目录执行）:
 #     ROM_ROOT=$PWD bash scripts/apply.sh
-# 环境变量:
-#     ROM_ROOT=<path>    默认 $(pwd)
-#     RUN_BUILD=1        默认 0（只应用补丁+配置，不编译；编译交给 workflow 下一步）
-#     LTO_MODE=thin      仅用于打印提示
-#     FORCE_PARTIAL_TRACK=x  debug 用，忽略 idempotency
-#
-# 幂等性: 三段（SSG / LRNG / 配置）各自独立开关，重复执行不会产生 .rej 噪声。
-#
-# 已验证（/tmp 沙箱用真实 5.10.236 源码逐 hunk 模拟）:
-#   * SSG → common/: 0 失败 0 fuzz
-#   * LRNG 主系列 25 patch: 22 个 100% 直接应用；4 个 hunk 被拒，位置恒定
-#   * 前置补丁过滤 2 个孤儿 include 后 hunk 计数改为 +6,8
-#   * 手工 rebase v59-09 后，07/08/10/11/12/13 仍可干净应用
-#   * CONFIG_LRNG 若出现在 vendor 趟合并链上会被 diffconfig 判为 "-LRNG" 并 exit 1（已实证）
+# 环境变量: ROM_ROOT / RUN_BUILD=0|1 / LTO_MODE=thin
 # =============================================================================
 set -eo pipefail
-export LC_ALL=C          # 保证 sort/grep 行为一致（EXPECTED_REJECTS 比较依赖字典序）
+export LC_ALL=C
 
-# ---------------------------------------------------------------------------
-# 0. 路径与参数
-# ---------------------------------------------------------------------------
 ROM_ROOT="${ROM_ROOT:-$(pwd)}"
 KP="${KP:-$ROM_ROOT/kernel_platform}"
 
-TREE_NAME="${TREE_NAME:-common}"     # v3: SSG 与 LRNG 统一落 common
+TREE_NAME="${TREE_NAME:-common}"
 TREE="$KP/$TREE_NAME"
 
-CFG_GKI="${CFG_GKI:-$KP/common/arch/arm64/configs/gki_defconfig}"   # BLOCKING-1 修正点
+CFG_GKI="${CFG_GKI:-$KP/common/arch/arm64/configs/gki_defconfig}"
+GKI_VENDOR="$KP/msm-kernel/arch/arm64/configs/gki_defconfig"
+FRAG="${FRAG:-$KP/common/arch/arm64/configs/consolidate.fragment}"
 
 LTO_MODE="${LTO_MODE:-thin}"
 RUN_BUILD="${RUN_BUILD:-0}"
@@ -59,7 +50,6 @@ WORK="${WORK:-/tmp/lrng-ssg-patches}"
 SRC="$WORK/src"
 LOG="$WORK/log"
 
-# 只在这些子树里扫描 .rej，避免对整个 common/（~8 万文件）反复 find
 REJ_SCOPE="drivers/char crypto kernel/sched include/linux block"
 
 GIT=(git -c 'safe.directory=*')
@@ -70,18 +60,17 @@ ok()   { echo "  ✅ $*"; }
 warn() { echo "  ⚠️  $*"; }
 
 # ---------------------------------------------------------------------------
-# 通用工具
+# 工具函数
 # ---------------------------------------------------------------------------
-find_rej() { # find_rej <tree> [args...]  —— 限定扫描范围
+find_rej() {
   local tree="$1"; shift
-  local paths=""
-  local d
+  local paths="" d
   for d in $REJ_SCOPE; do [ -d "$tree/$d" ] && paths="$paths $tree/$d"; done
   [ -n "$paths" ] || paths="$tree"
   find $paths -name '*.rej' "$@" 2>/dev/null || true
 }
 
-fetch() { # 重试下载（raw.githubusercontent 实测偶发 0 字节）
+fetch() {
   local url="$1" dest="$2" i
   for i in 1 2 3 4; do
     if curl -fsSL --retry 3 --retry-delay 2 --max-time 300 -o "$dest" "$url" && [ -s "$dest" ]; then
@@ -101,7 +90,7 @@ insert_before() {
     { print }' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 }
 
-apply_patch() { # apply_patch <tree> <patch> → 0 干净 / 1 部分(有 .rej) / 2 完全失败
+apply_patch() {
   local tree="$1" p="$2" name; name="$(basename "$p")"
   find_rej "$tree" -delete
   if "${GIT[@]}" -C "$tree" apply --check -p1 "$p" >/dev/null 2>&1; then
@@ -119,8 +108,8 @@ apply_patch() { # apply_patch <tree> <patch> → 0 干净 / 1 部分(有 .rej) /
   echo "    ❌ 完全失败: $name"; return 2
 }
 
-collect_rejects() { # 保留相对路径，避免同名 .rej 覆盖
-  local tree="$1" tag="$2" d="$LOG/rejects-$tag" r rel
+collect_rejects() {
+  local tree="$1" tag="${2:-lrng}" d="$LOG/rejects-$tag" r rel
   mkdir -p "$d"
   while IFS= read -r r; do
     [ -n "$r" ] || continue
@@ -138,23 +127,27 @@ mkdir -p "$SRC" "$LOG"
 [ -d "$KP" ]        || die "找不到 kernel_platform: $KP（在 repo 根目录执行）"
 [ -d "$TREE" ]      || die "找不到目标树: $TREE"
 [ -f "$CFG_GKI" ]   || die "找不到 GKI 配置: $CFG_GKI"
+[ -f "$GKI_VENDOR" ]|| die "找不到 vendor GKI 配置: $GKI_VENDOR"
+[ -f "$FRAG" ]      || die "找不到 consolidate fragment: $FRAG"
 command -v git  >/dev/null || die "需要 git"
 command -v curl >/dev/null || die "需要 curl"
-command -v git -C "$TREE" rev-parse >/dev/null 2>&1 || warn "$TREE 不是 git 仓库，git apply 将失败"
 
 cat <<EOF
 ==============================================================
  ROM_ROOT   = $ROM_ROOT
  kernel_plat= $KP
  目标树      = $TREE_NAME  ($TREE)
- 配置写入    = ${CFG_GKI#$KP/}   (v3: LRNG + SSG + USB 三合一)
- LTO         = $LTO_MODE （构建参数，不改文件）
+ 配置①       = ${CFG_GKI#$KP/}    (LRNG/SSG/USB)
+ 配置②       = ${FRAG#$KP/}   (调试项删除)
+ 插桩删除    = 两个 gki_defconfig 同步删除
+ LTO         = $LTO_MODE
  RUN_BUILD   = $RUN_BUILD
+ ⚠️ 请用 VARIANT=consolidate 构建
 ==============================================================
 EOF
 
 # ===========================================================================
-# 第一部分：SSG → common/
+# PART 1：SSG → common/
 # ===========================================================================
 info "PART 1 / SSG → $TREE_NAME/"
 SSG_PATCH="$SRC/ssg-f03f1386.patch"
@@ -174,9 +167,9 @@ grep -q 'ssg-iosched.o'  "$TREE/block/Makefile"        || die "SSG 校验失败:
 ok "SSG 校验通过"
 
 # ===========================================================================
-# 第二部分：LRNG → common/
+# PART 2：LRNG v59 → common/
 # ===========================================================================
-info "PART 2 / LRNG → $TREE_NAME/"
+info "PART 2 / LRNG v59 → $TREE_NAME/"
 LRNG_DONE=0
 if [ -f "$TREE/drivers/char/lrng/lrng_es_mgr.c" ] && \
    grep -qF 'source "drivers/char/lrng/Kconfig"' "$TREE/drivers/char/Kconfig"; then
@@ -190,7 +183,6 @@ if [ "$LRNG_DONE" -eq 0 ]; then
 PRE_RAW="$SRC/v59-000001-core.patch"
 PRE="$SRC/v59-000001-core.filtered.patch"
 [ -s "$PRE_RAW" ] || fetch "https://raw.githubusercontent.com/smuellerDD/lrng/v59/backports/v59-5.10.236/v59-000001-core.patch" "$PRE_RAW"
-# 原补丁加 3 个 include；hrtimer_api.h / ktime_api.h 在 v59 全套中无人提供 → 删除并修正 hunk 计数
 sed -e '/^+#include <linux\/hrtimer_api\.h>$/d' \
     -e '/^+#include <linux\/ktime_api\.h>$/d' \
     -e 's|^@@ -6,6 +6,10 @@|@@ -6,6 +6,8 @@|' "$PRE_RAW" > "$PRE"
@@ -234,7 +226,6 @@ SERIES=(
   v59-0024-LRNG-add-dev-lrng-device-file-support.patch
   v59-0025-LRNG-add-hwrand-framework-interface.patch
 )
-# LC_ALL=C 下 sort -u 的顺序：crypto/... < drivers/char/Kconfig < drivers/char/Makefile < kernel/...
 EXPECTED_REJECTS="crypto/drbg.c drivers/char/Kconfig drivers/char/Makefile kernel/sched/core.c"
 REJ_SEEN="$LOG/rejects-seen.txt"; : > "$REJ_SEEN"
 N_PARTIAL=0; N_FAILED=0
@@ -260,7 +251,7 @@ ok "主系列完成: ${#SERIES[@]} 补丁 | 部分被拒 $N_PARTIAL | 完全失�
 
 ACTUAL="$(sort -u "$REJ_SEEN" | tr '\n' ' ' | sed 's/ *$//')"
 if [ "$ACTUAL" != "$EXPECTED_REJECTS" ]; then
-  warn "被拒文件集合与预期不符（下面手工改基仍会尝试，但请复核 $LOG/series-rejects.log）"
+  warn "被拒文件集合与预期不符（手工改基仍会尝试，请复核 $LOG/series-rejects.log）"
   echo "        预期: $EXPECTED_REJECTS"
   echo "        实际: $ACTUAL"
 else
@@ -274,7 +265,7 @@ KCONFIG_F="$TREE/drivers/char/Kconfig"
 if grep -qF 'source "drivers/char/lrng/Kconfig"' "$KCONFIG_F"; then
   ok "已存在，跳过"
 else
-  LAST_EM="$(awk '/^endmenu$/{n=NR} END{print n}' "$KCONFIG_F")"   # common:511
+  LAST_EM="$(awk '/^endmenu$/{n=NR} END{print n}' "$KCONFIG_F")"
   [ -n "${LAST_EM:-}" ] && [ "$LAST_EM" -gt 0 ] || die "找不到顶层 endmenu: $KCONFIG_F"
   awk -v n="$LAST_EM" 'NR==n{print "source \"drivers/char/lrng/Kconfig\""; print ""} {print}' \
       "$KCONFIG_F" > "$KCONFIG_F.tmp" && mv "$KCONFIG_F.tmp" "$KCONFIG_F"
@@ -288,7 +279,6 @@ MAKEFILE_F="$TREE/drivers/char/Makefile"
 if grep -qF 'obj-$(CONFIG_LRNG)' "$MAKEFILE_F"; then
   ok "已存在，跳过"
 else
-  # 本树最后一行恰为 obj-$(CONFIG_ADI) += adi.o，全文无 ifdef 块 → 文件末尾即上游意图位置
   printf 'obj-$(CONFIG_LRNG)\t\t+= lrng/\n' >> "$MAKEFILE_F"
   ok "已追加 obj-\$(CONFIG_LRNG) += lrng/"
 fi
@@ -325,7 +315,7 @@ grep -qF 'add_sched_randomness'    "$SCHED_F" || warn "sched/core.c 未见 add_s
 
 # --- 2.4 后置补丁 -------------------------------------------------------
 BP_URL="https://raw.githubusercontent.com/smuellerDD/lrng/v59/backports/v59-5.10.236"
-info "后置: v59-09（官方补丁优先，失败则按补丁语义手工 rebase 4 行）"
+info "后置: v59-09（官方补丁优先，失败则手工 rebase 4 行）"
 P09="$SRC/v59-09-revert-split-random_init.patch"
 [ -s "$P09" ] || fetch "$BP_URL/v59-09-revert-split-random_init.patch" "$P09"
 LRNG_RK="$TREE/drivers/char/lrng/lrng_interface_random_kernel.c"
@@ -367,27 +357,24 @@ for name in v59-07-sha-includes.patch \
     collect_rejects "$TREE" lrng
   fi
 done
-# v3: 这些补丁对本基线应 100% 干净应用，失败=环境漂移 → 硬失败（v2 只是 warn）
 [ "$POST_FAIL" -eq 0 ] || die "后置补丁有 $POST_FAIL 个未干净应用，见 $LOG/series-rejects.log"
 
 cat > "$LOG/SKIPPED.txt" <<'EOF'
-本脚本刻意跳过的两个后置补丁：
+刻意跳过的两个后置补丁：
 
 v59-05-sysctl.patch
-    期望把 lrng_sysctl.c 的 random_table[] 改为非 static，并删除
+    期望把 lrng_sysctl.c 的 random_table[] 改为非 static 并删除
     random_sysctls_init()/device_initcall()。v59 源码仍是旧形态
     （lrng_sysctl.c:89 static、:134/:139 device_initcall），该补丁面向
     "更新内核把 sysctl 注册搬到别处" 的场景 → 对 5.10.236 应跳过。
-    （对 5.10.236 而言保留 device_initcall 注册才是正确形态。）
 
 v59-06-add_random_ready_callbacks.patch
-    要求新增 RAW_NOTIFIER_HEAD(lrng_ready_chain) 一整套 API；但 v59 源码
+    要求新增 RAW_NOTIFIER_HEAD(lrng_ready_chain) 一整套 API；v59 源码
     已改用 ATOMIC_NOTIFIER_HEAD(random_ready_notifier)
-    （lrng_interface_random_kernel.c:22）→ 该补丁属过时实现，跳过。
+    （lrng_interface_random_kernel.c:22）→ 过时实现，跳过。
 EOF
-ok "跳过 05/06 的原因已记录: $LOG/SKIPPED.txt"
+ok "跳过 05/06 的理由已记录: $LOG/SKIPPED.txt"
 
-# --- 2.5 落盘校验 -------------------------------------------------------
 fi  # LRNG_DONE
 
 [ -f "$TREE/include/linux/lrng.h" ]            || die "LRNG 校验失败: include/linux/lrng.h 缺失"
@@ -399,9 +386,9 @@ grep -qF 'obj-$(CONFIG_LRNG)'                 "$TREE/drivers/char/Makefile" || d
 ok "LRNG 校验通过（lrng/ 共 $N_LRNG 文件 + include/linux/lrng.h + 两处接线）"
 
 # ===========================================================================
-# 第三部分：配置（v3 全部写入 GKI 侧 gki_defconfig，避免污染 vendor 合并链）
+# PART 3：功能配置 → common/gki_defconfig
 # ===========================================================================
-info "PART 3 / 配置 → ${CFG_GKI#$KP/}"
+info "PART 3 / 功能配置 → ${CFG_GKI#$KP/}"
 BEFORE="$(wc -l < "$CFG_GKI" | tr -d ' ')"
 append_unique "$CFG_GKI" 'CONFIG_USB_AUTOSUSPEND_DELAY=5'
 append_unique "$CFG_GKI" 'CONFIG_MQ_IOSCHED_SSG=y'
@@ -409,38 +396,60 @@ append_unique "$CFG_GKI" 'CONFIG_MQ_IOSCHED_SSG_CGROUP=y'
 append_unique "$CFG_GKI" 'CONFIG_LRNG=y'
 AFTER="$(wc -l < "$CFG_GKI" | tr -d ' ')"
 ok "行数 $BEFORE → $AFTER"
-
 cat <<'NOTE'
-      说明：这 4 行写在 GKI 侧 gki_defconfig，理由：
-        · CONFIG_MQ_IOSCHED_SSG / CONFIG_LRNG 的源码只打在 common/，若写进
-          vendor 趟也会合并的 consolidate.fragment，会让 vendor 趟的
-          check_merged_defconfig 输出 "-符号" 并以
-          "ERROR! Defconfig fragment did not apply as expected" 退出 1；
-        · CONFIG_USB_AUTOSUSPEND_DELAY 同理（只写在 GKI 侧，避免双写冗余告警）；
-        · msm-kernel/arch/arm64/configs/gki_defconfig 不在这条合并链上，天然隔离。
+      说明：LRNG/SSG 的源码只打在 common/，且这两个符号在 msm-kernel 的 Kconfig 里不存在；
+      若写进两趟共享的 consolidate.fragment，vendor 趟会因"-符号"而 exit 1。
+      故写入仅 GKI 趟读取的 common/gki_defconfig。
 NOTE
 
 # ===========================================================================
-# 第四部分：ThinLTO（仅提示构建参数）
+# PART 3.5：省电减法 —— 删除运行期插桩（删除式，避免不可见符号触发构建中止）
+# ===========================================================================
+info "PART 3.5 / 省电减法：删除运行期插桩与调试项"
+
+INSTR_PAT='^#? ?CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO)'
+for g in "$CFG_GKI" "$GKI_VENDOR"; do
+  [ -f "$g" ] || die "找不到 $g"
+  if grep -qE "$INSTR_PAT" "$g"; then
+    n=$(grep -cE "$INSTR_PAT" "$g")
+    awk -v p="$INSTR_PAT" '$0 ~ p {next} {print}' "$g" > "$g.tmp" && mv "$g.tmp" "$g"
+    ok "已从 ${g#$KP/} 删除 $n 行插桩配置"
+  else
+    ok "${g#$KP/} 已无插桩配置，跳过"
+  fi
+done
+
+DBG_PAT='^#? ?CONFIG_(DEBUG_|LOCKDEP|LOCK_STAT|SLUB_DEBUG_ON|PAGE_POISONING|DYNAMIC_DEBUG)'
+KUNIT_PAT='^#? ?CONFIG_[A-Z0-9_]*KUNIT[A-Z0-9_]*'
+if grep -qE "$DBG_PAT|$KUNIT_PAT" "$FRAG"; then
+  n=$(grep -cE "$DBG_PAT|$KUNIT_PAT" "$FRAG")
+  awk -v p="$DBG_PAT" -v p2="$KUNIT_PAT" '$0 ~ p || $0 ~ p2 {next} {print}' "$FRAG" > "$FRAG.tmp" && mv "$FRAG.tmp" "$FRAG"
+  ok "已从 ${FRAG#$KP/} 删除 $n 行调试配置"
+else
+  ok "${FRAG#$KP/} 已无调试配置，跳过"
+fi
+
+# 校验：必须删干净，且不产生孤儿
+for g in "$CFG_GKI" "$GKI_VENDOR"; do
+  grep -qE "$INSTR_PAT" "$g" && die "插桩删除失败: $g 仍有残留" || true
+done
+grep -qE "$DBG_PAT|$KUNIT_PAT" "$FRAG" && die "调试项删除失败: $FRAG 仍有残留" || true
+ok "省电减法校验通过（两个 gki_defconfig + consolidate.fragment 均无残留）"
+
+# ===========================================================================
+# PART 4：ThinLTO 构建参数（不改文件）
 # ===========================================================================
 info "PART 4 / ThinLTO 构建参数"
 cat <<EOF
 --------------------------------------------------------------
- 推荐命令（workflow 中单独一步执行）：
+ 推荐命令：
    cd $ROM_ROOT
    export LTO=${LTO_MODE}
    ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio consolidate
 
- ⚠️ 注意：oplus_build_kernel.sh 只传 \$1 \$2，没有第 3 参（LTO），
-    必须 export LTO=${LTO_MODE}，否则非交互下会静默回落 defconfig 的 FULL LTO。
-
- 若手工拼环境（等价于 oplus_build_kernel.sh:6-14）：
-   export ANDROID_BUILD_TOP=\$PWD
-   export TARGET_BOARD_PLATFORM=taro
-   export ANDROID_PRODUCT_OUT=\$PWD/out/target/product/taro
-   export CHIPSET_COMPANY=QCOM OPLUS_VND_BUILD_PLATFORM=SM8475
-   export LTO=${LTO_MODE} EXTRA_KBUILD_ARGS="--skip abl"
-   ./kernel_platform/build/android/prepare_vendor.sh waipio consolidate
+ ⚠️ 必须用 consolidate（默认变体）：VARIANT=gki 会跑 check_defconfig，
+    配合 build.sh:357 的 set -e，配置不一致会直接中止构建。
+ ⚠️ oplus_build_kernel.sh 不接 LTO 参数，必须 export LTO=${LTO_MODE}。
 --------------------------------------------------------------
 EOF
 if [ "$RUN_BUILD" = "1" ]; then
@@ -459,8 +468,12 @@ cat <<EOF
  完成
    SSG  ($TREE_NAME): block/ssg-iosched.c, ssg-cgroup.c/.h + 接线
    LRNG ($TREE_NAME): drivers/char/lrng/ ($N_LRNG 文件) + include/linux/lrng.h + 接线
-   配置  : ${CFG_GKI#$KP/} ($AFTER 行)
-   日志  : $LOG/
-   LTO   : $LTO_MODE（仅构建参数）
+   配置①: ${CFG_GKI#$KP/} ($AFTER 行: USB/SSG/LRNG)
+   配置②: ${FRAG#$KP/}（调试项已删除）
+   插桩 : 两个 gki_defconfig 已删除 KASAN/KFENCE/UBSAN/PAGE_OWNER/DEBUG_INFO
+   KVM  : 未改动（原仓库已开启 CONFIG_VIRTUALIZATION=y + CONFIG_KVM=y）
+   cpuidle: 未改动（保持 qcom-cpu-lpm 原厂行为）
+   日志 : $LOG/
+   LTO  : $LTO_MODE
 ==============================================================
 EOF
