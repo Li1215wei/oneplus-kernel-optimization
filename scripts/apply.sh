@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# apply.sh —— 内核优化补丁应用（v5）
+# apply.sh —— 内核优化补丁应用（v6）
 #   目标机型: OnePlus Ace Pro (PGP110 / SM8475)
 #   代码基线: android12-5.10 / linux-5.10.236
 #
-# 优化项（6 项）:
+# 优化项:
 #   1. ThinLTO          —— 构建参数 export LTO=thin，不改文件
 #   2. LRNG v59         —— 打入 common/
 #   3. SSG I/O 调度器    —— 打入 common/
 #   4. USB 省电         —— CONFIG_USB_AUTOSUSPEND_DELAY=5
-#   5. 关闭调试选项      —— PART 3.5（删除式，见下）
+#   5. 关闭调试选项      —— PART 3.5（删除式）
 #   6. KVM              —— 原仓库已开启（CONFIG_VIRTUALIZATION=y + CONFIG_KVM=y），本脚本不动
 #   ❌ TEO              —— 不改：保持 qcom-cpu-lpm（原厂集群 LPM 感知）
 #
@@ -20,15 +20,25 @@
 #      → 配置与 savedefconfig 不一致时构建直接中止
 #
 # ⚠️ PART 3.5 为什么用「删除行」而不是「# CONFIG_X is not set」：
-#    - 写 "not set" 会让子选项（如 DEBUG_KMEMLEAK_MEM_POOL_SIZE、KASAN_HW_TAGS、
-#      *_KUNIT_TEST）变成"不可见符号" → 从 .config 消失 → 但仍在合并后的 defconfig 里
-#      → vendor 趟 check_merged_defconfig 输出 "-符号" → exit 1 → 构建中止
-#    - 删除行则只会在 .config 侧多出 "+符号"（允许），不会触发该守卫
-#    已实测：删除后 fragment 100→61 行、两个 gki_defconfig 各删 15 行，均无孤儿符号
+#    写 "not set" 会让子选项变成「不可见符号」→ 从 .config 消失，却仍留在合并后的
+#    defconfig 里 → vendor 趟 check_merged_defconfig 输出 "-符号" → exit 1 → 构建中止。
+#    删除行则只会在 .config 侧多出 "+符号"（允许），不会触发该守卫。
+#
+#    v6 修复（基于真实失败日志 build.log）:
+#      ERROR! Defconfig fragment did not apply as expected
+#      -BITS_TEST n
+#      -LINEAR_RANGES_TEST n
+#    原因：这两个是 KUnit 测试（depends on KUNIT）但名字不含 "KUNIT"，
+#    删掉 CONFIG_KUNIT 后它们变不可见符号 → 必须一并删除。
+#    已穷尽核对全树 depends on KUNIT 的 10 个符号，只有这两个会残留。
 #
 # 用法（在 repo/ROM 根目录执行）:
 #     ROM_ROOT=$PWD bash scripts/apply.sh
-# 环境变量: ROM_ROOT / RUN_BUILD=0|1 / LTO_MODE=thin
+# 环境变量:
+#     ROM_ROOT=<path>    默认 $(pwd)
+#     RUN_BUILD=1        默认 0（只应用补丁+配置，不编译）
+#     LTO_MODE=thin      仅用于打印提示
+#     POWER_LEAN=0|1     默认 1；置 0 可整体跳过 PART 3.5（用于二分定位构建失败）
 # =============================================================================
 set -eo pipefail
 export LC_ALL=C
@@ -45,6 +55,7 @@ FRAG="${FRAG:-$KP/common/arch/arm64/configs/consolidate.fragment}"
 
 LTO_MODE="${LTO_MODE:-thin}"
 RUN_BUILD="${RUN_BUILD:-0}"
+POWER_LEAN="${POWER_LEAN:-1}"
 
 WORK="${WORK:-/tmp/lrng-ssg-patches}"
 SRC="$WORK/src"
@@ -141,6 +152,7 @@ cat <<EOF
  配置②       = ${FRAG#$KP/}   (调试项删除)
  插桩删除    = 两个 gki_defconfig 同步删除
  LTO         = $LTO_MODE
+ POWER_LEAN  = $POWER_LEAN
  RUN_BUILD   = $RUN_BUILD
  ⚠️ 请用 VARIANT=consolidate 构建
 ==============================================================
@@ -403,10 +415,16 @@ cat <<'NOTE'
 NOTE
 
 # ===========================================================================
-# PART 3.5：省电减法 —— 删除运行期插桩（删除式，避免不可见符号触发构建中止）
+# PART 3.5：省电减法 —— 删除运行期插桩与调试项
+#   POWER_LEAN=0 可整体跳过，用于二分定位构建失败。
+#   为什么写 consolidate.fragment：它同时被 GKI 趟(Image) 与 vendor 趟(模块) 读取，
+#   能保证插桩配置一致；写 gki_defconfig 会触发 check_defconfig + set -e → 构建中止。
 # ===========================================================================
+if [ "$POWER_LEAN" = "1" ]; then
+
 info "PART 3.5 / 省电减法：删除运行期插桩与调试项"
 
+# 3.5.1 两个 gki_defconfig 同步删除插桩项
 INSTR_PAT='^#? ?CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO)'
 for g in "$CFG_GKI" "$GKI_VENDOR"; do
   [ -f "$g" ] || die "找不到 $g"
@@ -419,7 +437,12 @@ for g in "$CFG_GKI" "$GKI_VENDOR"; do
   fi
 done
 
-DBG_PAT='^#? ?CONFIG_(DEBUG_|LOCKDEP|LOCK_STAT|SLUB_DEBUG_ON|PAGE_POISONING|DYNAMIC_DEBUG)'
+# 3.5.2 consolidate.fragment 删除调试项
+#   注意 BITS_TEST / LINEAR_RANGES_TEST 是 KUnit 测试（depends on KUNIT）但名字不含
+#   "KUNIT"，删掉 CONFIG_KUNIT 后它们会变成不可见符号 → 从 .config 消失，却仍留在
+#   合并 defconfig 里 → check_merged_defconfig 输出 "-符号" → exit 1（构建中止）。
+#   已穷尽核对全树 depends on KUNIT 的 10 个符号，只有这两个会残留。
+DBG_PAT='^#? ?CONFIG_(DEBUG_|LOCKDEP|LOCK_STAT|SLUB_DEBUG_ON|PAGE_POISONING|DYNAMIC_DEBUG|BITS_TEST|LINEAR_RANGES_TEST)'
 KUNIT_PAT='^#? ?CONFIG_[A-Z0-9_]*KUNIT[A-Z0-9_]*'
 if grep -qE "$DBG_PAT|$KUNIT_PAT" "$FRAG"; then
   n=$(grep -cE "$DBG_PAT|$KUNIT_PAT" "$FRAG")
@@ -429,12 +452,16 @@ else
   ok "${FRAG#$KP/} 已无调试配置，跳过"
 fi
 
-# 校验：必须删干净，且不产生孤儿
+# 3.5.3 校验
 for g in "$CFG_GKI" "$GKI_VENDOR"; do
-  grep -qE "$INSTR_PAT" "$g" && die "插桩删除失败: $g 仍有残留" || true
+  if grep -qE "$INSTR_PAT" "$g"; then die "插桩删除失败: $g 仍有残留"; fi
 done
-grep -qE "$DBG_PAT|$KUNIT_PAT" "$FRAG" && die "调试项删除失败: $FRAG 仍有残留" || true
+if grep -qE "$DBG_PAT|$KUNIT_PAT" "$FRAG"; then die "调试项删除失败: $FRAG 仍有残留"; fi
 ok "省电减法校验通过（两个 gki_defconfig + consolidate.fragment 均无残留）"
+
+else
+  warn "POWER_LEAN=0 → 跳过 PART 3.5（保持原仓库调试配置，用于二分定位）"
+fi
 
 # ===========================================================================
 # PART 4：ThinLTO 构建参数（不改文件）
@@ -442,19 +469,27 @@ ok "省电减法校验通过（两个 gki_defconfig + consolidate.fragment 均�
 info "PART 4 / ThinLTO 构建参数"
 cat <<EOF
 --------------------------------------------------------------
- 推荐命令：
+ 构建命令（workflow 中单独一步执行）：
    cd $ROM_ROOT
    export LTO=${LTO_MODE}
-   ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio consolidate
+   ./kernel_platform/build/android/prepare_vendor.sh waipio consolidate
 
+ ⚠️ 本 manifest 无 vendor/oplus，因此不能用 oplus_build_kernel.sh
+    （其 build_cmd 硬 source vendor/oplus/kernel/prebuilt/vendorsetup.sh）
  ⚠️ 必须用 consolidate（默认变体）：VARIANT=gki 会跑 check_defconfig，
     配合 build.sh:357 的 set -e，配置不一致会直接中止构建。
- ⚠️ oplus_build_kernel.sh 不接 LTO 参数，必须 export LTO=${LTO_MODE}。
+ ⚠️ 必须 export LTO=${LTO_MODE}，否则回落 defconfig 的 FULL LTO。
 --------------------------------------------------------------
 EOF
 if [ "$RUN_BUILD" = "1" ]; then
-  ( cd "$ROM_ROOT" && export LTO="${LTO_MODE}" && \
-    ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio consolidate )
+  ( cd "$ROM_ROOT" \
+    && export LTO="${LTO_MODE}" \
+    && export TOPDIR="$ROM_ROOT" ANDROID_BUILD_TOP="$ROM_ROOT" \
+    && export TARGET_BOARD_PLATFORM=taro \
+    && export ANDROID_PRODUCT_OUT="$ROM_ROOT/out/target/product/taro" \
+    && export CHIPSET_COMPANY=QCOM OPLUS_VND_BUILD_PLATFORM=SM8475 \
+    && mkdir -p "$ANDROID_PRODUCT_OUT" \
+    && ./kernel_platform/build/android/prepare_vendor.sh waipio consolidate )
 else
   warn "RUN_BUILD=0，未编译（编译由 workflow 的 Build 步骤执行）"
 fi
@@ -469,7 +504,7 @@ cat <<EOF
    SSG  ($TREE_NAME): block/ssg-iosched.c, ssg-cgroup.c/.h + 接线
    LRNG ($TREE_NAME): drivers/char/lrng/ ($N_LRNG 文件) + include/linux/lrng.h + 接线
    配置①: ${CFG_GKI#$KP/} ($AFTER 行: USB/SSG/LRNG)
-   配置②: ${FRAG#$KP/}（调试项已删除）
+   配置②: ${FRAG#$KP/}（调试项已删除，POWER_LEAN=$POWER_LEAN）
    插桩 : 两个 gki_defconfig 已删除 KASAN/KFENCE/UBSAN/PAGE_OWNER/DEBUG_INFO
    KVM  : 未改动（原仓库已开启 CONFIG_VIRTUALIZATION=y + CONFIG_KVM=y）
    cpuidle: 未改动（保持 qcom-cpu-lpm 原厂行为）
