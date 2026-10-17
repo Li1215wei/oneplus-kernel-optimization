@@ -1,14 +1,8 @@
-name: Build Optimized Kernel
+name: Build Optimized Kernel + AnyKernel3
 
 on:
   workflow_dispatch:
     inputs:
-      variant:
-        description: 'kernel variant'
-        required: true
-        default: 'consolidate'
-        type: choice
-        options: [consolidate, gki]
       lto:
         description: 'LTO mode'
         required: true
@@ -16,25 +10,22 @@ on:
         type: choice
         options: [thin, full]
 
-# 全部步骤设为统一约定：
 env:
   LC_ALL: C
   LANG: C
   TZ: UTC
-  VARIANT: ${{ github.event.inputs.variant || 'consolidate' }}
+  VARIANT: consolidate
   LTO_MODE: ${{ github.event.inputs.lto || 'thin' }}
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 300          # 内核构建常见 1~3h（v3 新增，避免默认 6h 卡死占额度）
-
+    timeout-minutes: 300
     steps:
-      # ---------------------------------------------------------------- 0. 空间
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 16384    # 内核 5.10 mixed build 输出较大，v3 加大
+          root-reserve-mb: 16384
           temp-reserve-mb: 4096
           swap-size-mb: 8192
           remove-dotnet: 'true'
@@ -42,102 +33,85 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      # ---------------------------------------------------------------- 1. 依赖
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bison flex libssl-dev bc cpio rsync python3 python-is-python3 \
             lz4 xz-utils zip unzip git curl build-essential
-          # prepare_vendor.sh 里用 python（不是 python3），必须提供 python 软链
           python --version || true
-          git --version
 
-      # ---------------------------------------------------------------- 2. 检出工作流仓库
       - name: Checkout workflow repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # ---------------------------------------------------------------- 3. repo 工具
       - name: Install repo tool
         run: |
           curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/repo
           chmod a+x ~/repo
           sudo mv ~/repo /usr/local/bin/repo
-          repo --version | head -2
 
       - name: Configure git
         run: |
           git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-          git config --global --add safe.directory '*'   # 关键：repo 多仓库场景避免 dubious ownership
+          git config --global --add safe.directory '*'
 
       - name: Verify workflow repo files
         run: |
-          echo "=== workspace ==="; ls -la "$GITHUB_WORKSPACE"
-          echo "=== scripts ===";  ls -la "$GITHUB_WORKSPACE/scripts"  || echo "scripts NOT FOUND"
-          echo "=== manifest ==="; ls -la "$GITHUB_WORKSPACE/manifest" || echo "manifest NOT FOUND"
+          ls -la "$GITHUB_WORKSPACE"
+          ls -la "$GITHUB_WORKSPACE/scripts"  || echo "scripts NOT FOUND"
+          ls -la "$GITHUB_WORKSPACE/manifest" || echo "manifest NOT FOUND"
+          test -f "$GITHUB_WORKSPACE/scripts/apply.sh"     || echo "::error::scripts/apply.sh 缺失"
+          test -f "$GITHUB_WORKSPACE/scripts/anykernel.sh" || echo "::error::scripts/anykernel.sh 缺失"
 
-      # ---------------------------------------------------------------- 4. 同步源码
       - name: Init & sync source
         run: |
           mkdir k && cd k
           repo init -u https://github.com/${{ github.repository }}.git \
                     -m manifest/oneplus_10t.xml --depth=1
           repo sync -c -j8 --force-sync
-          echo "=== 顶层目录 ==="; ls -la
-          echo "=== kernel_platform ==="; ls -la kernel_platform | head -20
-          # repo 使用本地镜像 objects，depth=1 下 git describe 可能失败；打 tag 兜底
+          ls -la
           for d in kernel_platform/common kernel_platform/msm-kernel; do
             ( cd $d 2>/dev/null && git tag -f v5.10.236 HEAD >/dev/null 2>&1 || true )
           done
 
-      # ---------------------------------------------------------------- 5. 前提自检（早失败，省时间）
       - name: Preflight checks
         run: |
           set -e
-          echo "=== 1) vendor 树（oplus_build_kernel.sh 会 source 它） ==="
           if [ -f k/vendor/oplus/kernel/prebuilt/vendorsetup.sh ]; then
             echo "OK: vendor/oplus 存在"
           else
-            echo "::warning::vendor/oplus/kernel/prebuilt/vendorsetup.sh 不存在，构建步骤将改为手工拼环境"
+            echo "::warning::vendor/oplus 缺失，构建将走手工拼环境分支"
           fi
-          echo "=== 2) 构建脚本 ==="
           ls -l k/kernel_platform/oplus/build/oplus_build_kernel.sh
           ls -l k/kernel_platform/build/android/prepare_vendor.sh
-          echo "=== 3) 工具链 prebuilts ==="
-          ls -d k/kernel_platform/prebuilts/clang/host/linux-x86/* 2>/dev/null | head -3 \
-            || echo "::warning::未发现 prebuilt clang，可能需要 HERMETIC_TOOLCHAIN=0"
-          echo "=== 4) 关键锚点（apply.sh 依赖） ==="
           grep -n '^endmenu' k/kernel_platform/common/drivers/char/Kconfig | tail -1
-          tail -1  k/kernel_platform/common/drivers/char/Makefile
+          tail -1 k/kernel_platform/common/drivers/char/Makefile
           grep -c 'drbg_cores\[\] = {' k/kernel_platform/common/crypto/drbg.c
           grep -c 'ttwu_stat' k/kernel_platform/common/kernel/sched/core.c
+          ls -l k/kernel_platform/common/arch/arm64/configs/consolidate.fragment
+          grep -n 'KERNEL_BINARY' k/kernel_platform/msm-kernel/build.config.msm.common
 
-      # ---------------------------------------------------------------- 6. 打补丁 + 配置
-      - name: Apply optimizations (SSG + LRNG + configs)
+      - name: Apply optimizations (SSG + LRNG + configs + power-lean)
         run: |
           set -e
           cp "$GITHUB_WORKSPACE/scripts/apply.sh" /tmp/apply.sh
           chmod +x /tmp/apply.sh
           cd k
-          ROM_ROOT="$PWD" RUN_BUILD=0 bash /tmp/apply.sh
+          ROM_ROOT="$PWD" RUN_BUILD=0 LTO_MODE="${LTO_MODE}" bash /tmp/apply.sh 2>&1 | tee apply.log
 
-      # ---------------------------------------------------------------- 7. 构建（ThinLTO）
       - name: Build kernel (LTO=${{ env.LTO_MODE }})
         run: |
           set -euo pipefail
           cd k
-          export LTO="${LTO_MODE}"          # 必须 export：oplus_build_kernel.sh 不接 LTO 参数
+          export LTO="${LTO_MODE}"
           echo "LTO=${LTO} VARIANT=${VARIANT}"
-
           if [ -f vendor/oplus/kernel/prebuilt/vendorsetup.sh ]; then
-            # 官方入口
             ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio "${VARIANT}" 2>&1 | tee build.log
           else
-            # 回退：手工拼 oplus_build_kernel.sh:6-14 设置的环境
             export ANDROID_BUILD_TOP="$PWD"
             export TOPDIR="$PWD"
             export TARGET_BOARD_PLATFORM=taro
@@ -149,54 +123,123 @@ jobs:
             ./kernel_platform/build/android/prepare_vendor.sh waipio "${VARIANT}" 2>&1 | tee build.log
           fi
 
-      # ---------------------------------------------------------------- 8. 验证
-      - name: Verify patches & LTO mode
+      - name: Verify patches, LTO, power-lean and artifacts
         if: always()
         run: |
           cd k || exit 0
-          echo "=== A) LTO 改写日志 ==="
-          grep -n "Modifying LTO mode to '${LTO_MODE}'" build.log || echo "::error::未见 LTO 改写日志"
-          echo "=== B) 双趟 .config（mixed build：Image 来自 gki_kernel） ==="
-          for c in $(find out -maxdepth 3 -name '.config' 2>/dev/null); do
-            echo "--- $c ---"
-            grep -E '^#? ?CONFIG_(LTO_CLANG|LTO_NONE|THINLTO|CFI_CLANG|LRNG|MQ_IOSCHED_SSG|USB_AUTOSUSPEND_DELAY)' "$c" || true
-          done
-          echo "=== C) 源码落盘 ==="
-          ls kernel_platform/common/block/ssg-iosched.c
-          ls kernel_platform/common/drivers/char/lrng | wc -l
-          ls kernel_platform/common/include/linux/lrng.h
-          echo "=== D) 产物 ==="
-          find out -maxdepth 4 \( -name 'Image*' -o -name 'dtbo.img' -o -name 'vendor_dlkm.img' \) 2>/dev/null | head -20
+          OUT="kernel_platform/out/msm-waipio-waipio-${VARIANT}"
 
-      # ---------------------------------------------------------------- 9. 产物上传（v3 新增）
-      - name: Upload kernel images
+          echo "=== A) LTO ==="
+          grep -n "Modifying LTO mode to '${LTO_MODE}'" build.log || echo "::error::未见 LTO 改写日志"
+
+          echo "=== B) 两趟 .config：插桩必须全部非 y ==="
+          for c in "${OUT}/gki_kernel/common/.config" "${OUT}/msm-kernel/.config"; do
+            [ -f "$c" ] || { echo "::warning::$c 不存在"; continue; }
+            echo "--- $c ---"
+            if grep -qE '^CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO|LOCKDEP|DEBUG_OBJECTS|KUNIT)=y' "$c"; then
+              echo "::error::仍有插桩项为 y（省电减法未生效）"
+              grep -E '^CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO|LOCKDEP|DEBUG_OBJECTS|KUNIT)=y' "$c"
+            else
+              echo "OK: 插桩项已全部关闭"
+            fi
+            grep -E '^#? ?CONFIG_(LTO_CLANG|LTO_NONE|THINLTO|CFI_CLANG|LRNG|MQ_IOSCHED_SSG|USB_AUTOSUSPEND_DELAY|KVM|VIRTUALIZATION)' "$c" || true
+          done
+
+          echo "=== C) 源码落盘 ==="
+          ls -l kernel_platform/common/block/ssg-iosched.c
+          ls kernel_platform/common/drivers/char/lrng | wc -l
+          ls -l kernel_platform/common/include/linux/lrng.h
+          echo "--- 调试项应已删除 ---"
+          grep -cE 'CONFIG_(DEBUG_|LOCKDEP|LOCK_STAT|SLUB_DEBUG_ON|PAGE_POISONING|KUNIT)' kernel_platform/common/arch/arm64/configs/consolidate.fragment || echo "0（已清空）"
+          grep -cE 'CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO)' kernel_platform/common/arch/arm64/configs/gki_defconfig || echo "0（已清空）"
+
+          echo "=== D) 产物 ==="
+          ls -lh "${OUT}/dist/" 2>/dev/null || echo "::error::dist 不存在"
+          ls -lh "${OUT}/gki_kernel/dist/" 2>/dev/null || echo "::error::gki_kernel/dist 不存在"
+
+          echo "=== E) 刷机必需文件硬校验 ==="
+          MISS=0
+          for f in boot.img vendor_boot.img dtbo.img vendor_dlkm.img odm_dlkm.img super.img; do
+            if [ -s "${OUT}/dist/$f" ]; then echo "OK  $f"; else echo "::error::$f 缺失"; MISS=$((MISS+1)); fi
+          done
+          for f in Image Image.lz4 System.map vmlinux; do
+            if [ -s "${OUT}/gki_kernel/dist/$f" ]; then echo "OK  $f"; else echo "::error::$f 缺失"; MISS=$((MISS+1)); fi
+          done
+          [ "$MISS" -eq 0 ] || { echo "::error::共 $MISS 个关键产物缺失"; exit 1; }
+
+      - name: Package AnyKernel3 zip
+        if: always()
+        run: |
+          set -euo pipefail
+          cd k
+          OUT="kernel_platform/out/msm-waipio-waipio-${VARIANT}"
+          DIST="${OUT}/dist"
+          IMG="${OUT}/gki_kernel/dist/Image"
+
+          [ -s "$IMG" ] || { echo "::error::Image 缺失，无法打包 AK3"; exit 1; }
+
+          echo "=== 1) 拉取 AK3 模板 ==="
+          rm -rf /tmp/ak3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/ak3
+          rm -rf /tmp/ak3/.git /tmp/ak3/README.md
+          rm -f /tmp/ak3/Image* /tmp/ak3/zImage* /tmp/ak3/dzImage /tmp/ak3/boot.img
+
+          echo "=== 2) 放入内核镜像（boot.img 用未压缩 Image：KERNEL_BINARY=Image） ==="
+          cp "$IMG" /tmp/ak3/Image
+          ls -lh /tmp/ak3/Image
+
+          echo "=== 3) 放入配套模块分区 ==="
+          for f in vendor_dlkm.img odm_dlkm.img dtbo.img; do
+            if [ -f "${DIST}/$f" ]; then cp "${DIST}/$f" /tmp/ak3/; echo "  已加入 $f";
+            else echo "::warning::缺少 ${DIST}/$f"; fi
+          done
+
+          echo "=== 4) 写入定制 anykernel.sh ==="
+          cp "$GITHUB_WORKSPACE/scripts/anykernel.sh" /tmp/ak3/anykernel.sh
+
+          echo "=== 5) 打包 ==="
+          cd /tmp/ak3
+          ZIP_NAME="PGP110-Kernel-${VARIANT}-${LTO_MODE}-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "$ZIP_NAME" anykernel.sh META-INF tools Image vendor_dlkm.img odm_dlkm.img dtbo.img 2>/dev/null || \
+            zip -r9 "$ZIP_NAME" anykernel.sh META-INF tools Image vendor_dlkm.img odm_dlkm.img
+          cp "$ZIP_NAME" "$GITHUB_WORKSPACE/"
+          unzip -l "$ZIP_NAME" | head -25
+          ls -lh "$ZIP_NAME"
+
+      - name: Upload AnyKernel3 zip
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anykernel3-${{ env.VARIANT }}-${{ env.LTO_MODE }}
+          path: ${{ github.workspace }}/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload kernel images (raw)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kernel-images-${{ env.VARIANT }}-${{ env.LTO_MODE }}
           path: |
-            k/out/*/dist/Image
-            k/out/*/dist/Image.lz4
-            k/out/*/dist/dtbo.img
-            k/out/*/dist/vendor_dlkm.img
-            k/out/*/dist/boot.img
-            k/out/*/dist/System.map
-            k/out/*/dist/*.mbn
-          if-no-files-found: warn
+            k/kernel_platform/out/*/dist/*.img
+            k/kernel_platform/out/*/dist/*.tar.gz
+            k/kernel_platform/out/*/dist/Module.symvers
+            k/kernel_platform/out/*/gki_kernel/dist/Image
+            k/kernel_platform/out/*/gki_kernel/dist/Image.lz4
+            k/kernel_platform/out/*/gki_kernel/dist/System.map
+            k/kernel_platform/out/*/gki_kernel/dist/vmlinux
+            k/kernel_platform/out/*/gki_kernel/dist/modules.builtin*
+            k/kernel_platform/out/*/gki_kernel/dist/abi.*
+          if-no-files-found: error
           retention-days: 14
 
-      - name: Upload build log
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
-          path: k/build.log
-          if-no-files-found: warn
-
-      - name: Upload apply.sh logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: apply-log
-          path: /tmp/lrng-ssg-patches/log
+          name: build-logs
+          path: |
+            k/build.log
+            k/apply.log
+            /tmp/lrng-ssg-patches/log
           if-no-files-found: warn
