@@ -61,7 +61,7 @@ dump_boot;
 write_boot;
 ## end boot install
 
-### 模块分区（必须与内核同时更新）
+### 模块分区（必须与内核同时更新，否则 __asan_* 符号不匹配导致模块加载失败）
 flash_partition vendor_dlkm vendor_dlkm.img
 flash_partition odm_dlkm   odm_dlkm.img
 
