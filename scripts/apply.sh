@@ -259,20 +259,14 @@ else
 fi
 
 # --- 2.3 四处手工改基（对应 4 个被拒 hunk） ------------------------------
-info "手工改基 1/4: $LRNG_TREE_NAME/drivers/char/Kconfig —— 末尾 endmenu 前引入 lrng"
-KCONFIG_F="$LRNG_TREE/drivers/char/Kconfig"
-if grep -q 'source "drivers/char/lrng/Kconfig"' "$KCONFIG_F"; then
+info "手工改基 2/4: $LRNG_TREE_NAME/drivers/char/Makefile —— 接线 lrng/"
+MAKEFILE_F="$LRNG_TREE/drivers/char/Makefile"
+if grep -q '^obj-\$(CONFIG_LRNG)' "$MAKEFILE_F"; then
   ok "已存在，跳过"
 else
-  # 补丁原意是插在 "config ADI" 之后紧跟的 endmenu 之前；本树 ADI 与 endmenu 之间还有其它条目，
-  # 故定位「最后一个 ^endmenu$」（common:511 / msm-kernel:529），语义等价且树无关。
-  LAST_EM="$(awk '/^endmenu$/{n=NR} END{print n}' "$KCONFIG_F")"
-  [ -n "${LAST_EM:-}" ] && [ "$LAST_EM" -gt 0 ] || die "找不到 endmenu: $KCONFIG_F"
-  awk -v n="$LAST_EM" 'NR==n{print "source \"drivers/char/lrng/Kconfig\""; print ""} {print}' \
-      "$KCONFIG_F" > "$KCONFIG_F.tmp" && mv "$KCONFIG_F.tmp" "$KCONFIG_F"
-  ok "已在第 $LAST_EM 行（endmenu）前插入 source（+2 行）"
+  echo 'obj-$(CONFIG_LRNG)		+= lrng/' >> "$MAKEFILE_F"
+  ok "已在 Makefile 末尾追加 obj-\$(CONFIG_LRNG) += lrng/（+1 行）"
 fi
-
 info "手工改基 2/4: $LRNG_TREE_NAME/drivers/char/Makefile —— 接线 lrng/"
 MAKEFILE_F="$LRNG_TREE/drivers/char/Makefile"
 if grep -q '^obj-\$(CONFIG_LRNG)[[:space:]]*+=[[:space:]]*lrng/' "$MAKEFILE_F"; then
