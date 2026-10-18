@@ -425,8 +425,20 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload vendor dist images (optional - pure boot mode ignores these)
+      - name: Check vendor dist exists
+        id: check_dist
         if: always()
+        run: |
+          if ls k/kernel_platform/out/*/dist/*.img >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "vendor dist 存在，将上传"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "vendor dist 不存在（纯 boot 模式正常），跳过上传"
+          fi
+
+      - name: Upload vendor dist images (optional)
+        if: always() && steps.check_dist.outputs.exists == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: vendor-dist-${{ env.VARIANT }}-${{ env.LTO_MODE }}-lean${{ env.POWER_LEAN }}
