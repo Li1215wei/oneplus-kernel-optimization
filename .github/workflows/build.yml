@@ -1,4 +1,4 @@
-name: Build Optimized Kernel + AnyKernel3
+name: Build Optimized Kernel + AnyKernel3 (boot only)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
         type: choice
         options: [thin, full]
       power_lean:
-        description: 'PART 3.5 省电减法（0 = 跳过，用于二分定位构建失败）'
+        description: 'PART 3.5: 1=删除 DEBUG_INFO（仅减小 vmlinux）, 0=保留'
         required: true
         default: '1'
         type: choice
@@ -140,7 +140,7 @@ jobs:
           [ "$MISS" -eq 0 ] || { echo "::error::共 $MISS 个必需路径缺失"; exit 1; }
 
       # ---------------------------------------------------------------- 6. 打补丁 + 配置
-      - name: Apply optimizations (SSG + LRNG + configs + power-lean)
+      - name: Apply optimizations (SSG + LRNG + configs + DEBUG_INFO)
         run: |
           set -e
           cp "$GITHUB_WORKSPACE/scripts/apply.sh" /tmp/apply.sh
@@ -189,7 +189,7 @@ jobs:
           exit "$RC"
 
       # ---------------------------------------------------------------- 8. 验证
-      - name: Verify patches, LTO, power-lean and artifacts
+      - name: Verify patches, LTO, CRC-safety and artifacts
         if: always()
         run: |
           cd k || exit 0
@@ -203,54 +203,64 @@ jobs:
             echo "::error::未见 LTO 改写日志"; FAIL=$((FAIL+1))
           fi
 
-          echo "=== B) 两趟 .config：插桩必须全部非 y ==="
+          echo "=== B) ★ CRC 保护校验（纯 boot 方案的核心）★ ==="
+          # 纯 boot 要求：所有影响符号 CRC 的 CONFIG 必须保持为 y（与原厂一致），
+          # 否则原厂 vendor_dlkm/odm_dlkm 模块会因 "disagrees about version of
+          # symbol" 被拒载（CONFIG_MODVERSIONS=y，MODULE_FORCE_LOAD=n）
+          CRC_MUST_BE_Y='CONFIG_(KASAN|KASAN_HW_TAGS|KFENCE|PAGE_OWNER|UBSAN|UBSAN_TRAP|UBSAN_LOCAL_BOUNDS|LOCKDEP|LOCK_STAT|DEBUG_LOCK_ALLOC|DEBUG_OBJECTS|DEBUG_PREEMPT|DEBUG_SPINLOCK|DEBUG_MUTEXES|DEBUG_RT_MUTEXES|DEBUG_RWSEMS|SLUB_DEBUG_ON|PAGE_POISONING|DYNAMIC_DEBUG|KUNIT)'
           for c in "${OUT}/gki_kernel/common/.config" "${OUT}/msm-kernel/.config"; do
             if [ ! -f "$c" ]; then echo "::warning::$c 不存在"; continue; fi
             echo "--- $c ---"
-            if grep -qE '^CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO|LOCKDEP|DEBUG_OBJECTS|KUNIT)=y' "$c"; then
-              echo "::error::仍有插桩项为 y（省电减法未生效）"
-              grep -E '^CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO|LOCKDEP|DEBUG_OBJECTS|KUNIT)=y' "$c" || true
-              FAIL=$((FAIL+1))
+            if grep -qE "^${CRC_MUST_BE_Y}=y" "$c"; then
+              N=$(grep -cE "^${CRC_MUST_BE_Y}=y" "$c")
+              echo "OK: CRC 相关配置保持为 y（$N 项）"
+              grep -E "^${CRC_MUST_BE_Y}=y" "$c" | head -25 || true
             else
-              echo "OK: 插桩项已全部关闭"
+              echo "::error::未找到任何 CRC 相关配置为 y —— 纯 boot 方案失效！"
+              echo "::error::删除这些项会改变 __kcrctab，原厂模块将全部拒载"
+              FAIL=$((FAIL+1))
             fi
-            echo "--- 功能项（应存在） ---"
-            grep -E '^#? ?CONFIG_(LTO_CLANG|LTO_NONE|THINLTO|CFI_CLANG|LRNG|MQ_IOSCHED_SSG|USB_AUTOSUSPEND_DELAY|KVM|VIRTUALIZATION)' "$c" || true
-            echo "--- 不可见符号残留检查（应为空：BITS_TEST / LINEAR_RANGES_TEST） ---"
-            grep -nE 'CONFIG_(BITS_TEST|LINEAR_RANGES_TEST)' "$c" || echo "OK: 已随 KUNIT 一起消失"
+            echo "--- 被删除的调试项（必须为空）---"
+            if grep -qE "^# CONFIG_(KASAN|KFENCE|PAGE_OWNER|UBSAN|LOCKDEP)=n$" "$c"; then
+              echo "::warning::检测到显式 n（正常，删除行也会导致默认 n）"
+            fi
           done
 
-          echo "=== C) 源码落盘 ==="
+          echo "=== C) DEBUG_INFO 允许删除，其余插桩不允许 ==="
+          for c in "${OUT}/gki_kernel/common/.config" "${OUT}/msm-kernel/.config"; do
+            [ -f "$c" ] || continue
+            echo "--- $(basename $(dirname $(dirname $c))) ---"
+            grep -E '^#? ?CONFIG_DEBUG_INFO(_DWARF4)?=' "$c" || echo "  (DEBUG_INFO 已删除)"
+            grep -E '^CONFIG_(KASAN|KFENCE|PAGE_OWNER|UBSAN|LOCKDEP)=' "$c" || echo "  ::error::CRC 相关项缺失"
+          done
+
+          echo "=== D) 源码落盘 ==="
           ls -l kernel_platform/common/block/ssg-iosched.c || FAIL=$((FAIL+1))
           echo -n "lrng 文件数: "; ls kernel_platform/common/drivers/char/lrng 2>/dev/null | wc -l
           ls -l kernel_platform/common/include/linux/lrng.h || FAIL=$((FAIL+1))
-          echo "--- 调试项应已删除（下面两个计数都应为 0） ---"
-          echo -n "fragment 残留调试/测试项: "
-          grep -cE '^#? ?CONFIG_(DEBUG_|LOCKDEP|LOCK_STAT|SLUB_DEBUG_ON|PAGE_POISONING|KUNIT|BITS_TEST|LINEAR_RANGES_TEST)' \
-            kernel_platform/common/arch/arm64/configs/consolidate.fragment || true
-          echo -n "gki_defconfig 残留插桩项: "
-          grep -cE '^#? ?CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO)' \
-            kernel_platform/common/arch/arm64/configs/gki_defconfig || true
+          echo -n "consolidate.fragment 行数: "
+          wc -l < kernel_platform/common/arch/arm64/configs/consolidate.fragment 2>/dev/null || echo 0
 
-          echo "=== D) 产物列表 ==="
+          echo "=== E) 产物列表 ==="
           ls -lh "${OUT}/dist/" 2>/dev/null || echo "::error::dist 不存在"
           ls -lh "${OUT}/gki_kernel/dist/" 2>/dev/null || echo "::error::gki_kernel/dist 不存在"
 
-          echo "=== E) Image 体积（关插桩后应明显小于 50MB） ==="
+          echo "=== F) Image 体积（保留插桩，应与基线 ~57MB 接近，而非 39MB）==="
           IMG="${OUT}/gki_kernel/dist/Image"
           if [ -s "$IMG" ]; then
             SZ=$(stat -c %s "$IMG")
             echo "Image = ${SZ} bytes ($((SZ/1024/1024)) MB)"
-            if [ "$SZ" -gt 52428800 ]; then
-              echo "::warning::Image > 50MB，插桩可能未完全关闭（基线约 57MB，本次应约 39MB）"
+            if [ "$SZ" -lt 45000000 ]; then
+              echo "::warning::Image 明显小于基线（57MB），说明插桩可能被误删，CRC 会变"
             fi
           else
             echo "::error::Image 缺失"; FAIL=$((FAIL+1))
           fi
 
-          echo "=== F) 刷机必需文件硬校验 ==="
-          for f in boot.img vendor_boot.img dtbo.img vendor_dlkm.img odm_dlkm.img super.img; do
-            if [ -s "${OUT}/dist/$f" ]; then echo "OK  $f"; else echo "::error::$f 缺失"; FAIL=$((FAIL+1)); fi
+          echo "=== G) boot 相关产物（纯 boot 只需 boot.img + vendor_boot.img + dtbo.img）==="
+          for f in boot.img vendor_boot.img dtbo.img; do
+            if [ -s "${OUT}/dist/$f" ]; then echo "OK  $f ($(du -h "${OUT}/dist/$f" | cut -f1))";
+            else echo "::error::$f 缺失"; FAIL=$((FAIL+1)); fi
           done
           for f in Image Image.lz4 System.map vmlinux; do
             if [ -s "${OUT}/gki_kernel/dist/$f" ]; then echo "OK  $f"; else echo "::error::$f 缺失"; FAIL=$((FAIL+1)); fi
@@ -260,13 +270,12 @@ jobs:
           echo "全部校验通过 ✅"
 
       # ---------------------------------------------------------------- 9. 打包 AK3
-      - name: Package AnyKernel3 zip
+      - name: Package AnyKernel3 zip (boot only)
         if: always()
         run: |
           set -euo pipefail
           cd k
           OUT="kernel_platform/out/msm-waipio-waipio-${VARIANT}"
-          DIST="${OUT}/dist"
           IMG="${OUT}/gki_kernel/dist/Image"
 
           if [ ! -s "$IMG" ]; then
@@ -284,17 +293,9 @@ jobs:
           cp "$IMG" /tmp/ak3/Image
           ls -lh /tmp/ak3/Image
 
-          echo "=== 3) 放入配套模块分区（KASAN 关闭后 stock 模块不兼容，必须同步刷） ==="
-          MISSING=""
-          for f in vendor_dlkm.img odm_dlkm.img dtbo.img; do
-            if [ -s "${DIST}/$f" ]; then
-              cp "${DIST}/$f" /tmp/ak3/
-              echo "  已加入 $f ($(du -h "${DIST}/$f" | cut -f1))"
-            else
-              MISSING="$MISSING $f"
-              echo "::warning::缺少 ${DIST}/$f"
-            fi
-          done
+          echo "=== 3) 纯 boot 模式：不打包任何其他分区 ==="
+          echo "  vendor_dlkm.img / odm_dlkm.img / dtbo.img 均不放入 AK3 包"
+          echo "  （本内核 CRC 与原厂一致，原厂模块可直接继续使用）"
 
           echo "=== 4) 写入定制 anykernel.sh ==="
           cp "$GITHUB_WORKSPACE/scripts/anykernel.sh" /tmp/ak3/anykernel.sh
@@ -302,20 +303,28 @@ jobs:
           echo "=== 5) 打包 ==="
           cd /tmp/ak3
           ZIP_NAME="PGP110-Kernel-${VARIANT}-${LTO_MODE}-$(date +%Y%m%d-%H%M).zip"
-          FILES="anykernel.sh META-INF tools Image"
-          for f in vendor_dlkm.img odm_dlkm.img dtbo.img; do
-            if [ -f "$f" ]; then FILES="$FILES $f"; fi
-          done
-          zip -r9 "$ZIP_NAME" $FILES
+          zip -r9 "$ZIP_NAME" anykernel.sh META-INF tools Image
           cp "$ZIP_NAME" "$GITHUB_WORKSPACE/"
           echo "=== AK3 包内容 ==="
           unzip -l "$ZIP_NAME" | head -30
           ls -lh "$ZIP_NAME"
 
-          if [ -n "$MISSING" ]; then
-            echo "::error::AK3 包缺少:$MISSING —— 因内核关闭了 KASAN，stock vendor_dlkm 的 __asan_* 引用会加载失败，此包不可刷"
-            exit 1
-          fi
+          echo "=== 6) 硬校验：包内必须有 anykernel.sh / update-binary / Image，且不含模块分区 ==="
+          for need in anykernel.sh META-INF/com/google/android/update-binary Image; do
+            if unzip -l "$ZIP_NAME" | grep -q "$need"; then
+              echo "OK  $need"
+            else
+              echo "::error::AK3 包缺少 $need"
+              exit 1
+            fi
+          done
+          for forbid in vendor_dlkm.img odm_dlkm.img dtbo.img; do
+            if unzip -l "$ZIP_NAME" | grep -q "$forbid"; then
+              echo "::error::AK3 包不应包含 $forbid（纯 boot 模式）"
+              exit 1
+            fi
+          done
+          echo "AK3 包正确（纯 boot：仅 anykernel.sh + tools + Image）✅"
           echo "AK3 包完整（Image + vendor_dlkm + odm_dlkm）✅"
 
       # ---------------------------------------------------------------- 10. 上传
