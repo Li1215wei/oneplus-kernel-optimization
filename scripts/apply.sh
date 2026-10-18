@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# apply.sh —— 内核优化补丁应用（v8 · 纯 boot 模式）
+# apply.sh —— 内核优化补丁应用（v9 · 纯 boot 模式）
 #   目标机型: OnePlus Ace Pro (PGP110 / SM8475)
 #   代码基线: android12-5.10 / linux-5.10.236
 #
@@ -495,41 +495,67 @@ fi
 #
 #   CONFIG_LOCALVERSION_AUTO 默认 y（common/init/Kconfig:180-183），
 #   common/scripts/setlocalversion:208-210 会追加所在 git 仓库 HEAD 的短哈希。
-#   而 GKI 趟在 common/ 编译、vendor 趟在 msm-kernel/ 编译 —— 两个独立仓库，
-#   HEAD 天然不同，于是：
+#   GKI 趟在 common/ 编译、vendor 趟在 msm-kernel/ 编译 —— 两个独立仓库，
+#   HEAD 天然不同，于是内核与模块的 release 字符串不一致：
 #       内核 Image : 5.10.236-qki-consolidate-android12-9-o-gc076c7357bf1-dirty
 #       全部模块   : 5.10.236-qki-consolidate-g9f869b57a717-dirty
 #
-#   注意：MODVERSIONS=y 时内核会忽略 vermagic 的版本前缀
+#   注意 1：MODVERSIONS=y 时内核会忽略 vermagic 的版本前缀
 #   （kernel/module.c:1378-1387 same_magic() 跳过空格前部分），
-#   所以字符串不一致 "本身" 不致命；统一它是为了便于用 uname -r 判断版本、
-#   并让 CI 的 vermagic 校验可读。真正的兼容性由 __kcrctab CRC 决定。
+#   所以字符串不一致"本身"不致命；真正的兼容性由 __kcrctab CRC 决定。
+#   统一它是为了让 uname -r 能可靠对应构建，并简化排查。
+#
+#   注意 2（v9 修正 —— 来自真实构建失败日志）：
+#     ERROR! Defconfig fragment did not apply as expected
+#     -MODULE_SCMVERSION y
+#   CONFIG_MODULE_SCMVERSION（common/init/Kconfig）带
+#       depends on LOCALVERSION_AUTO
+#   关闭 LOCALVERSION_AUTO 后它变成"不可见符号"→ 从 .config 消失，却仍留在
+#   合并后的 defconfig 里 → vendor 趟 check_merged_defconfig 输出 "-符号"
+#   → 配合 build.sh:357 的全局 set -e → 构建中止。
+#   ⇒ 关闭 LOCALVERSION_AUTO 时必须同步删除 MODULE_SCMVERSION 行。
+#   已穷尽核对：全树只有 MODULE_SCMVERSION 一个符号 depends on LOCALVERSION_AUTO。
 # ===========================================================================
 info "PART 3.6 / 统一版本字符串（关闭 LOCALVERSION_AUTO）"
 
 VFLAG='# CONFIG_LOCALVERSION_AUTO is not set'
+# 依赖 LOCALVERSION_AUTO 的符号，必须一并移除（否则会变成不可见符号导致构建中止）
+SCM_PAT='^#? ?CONFIG_MODULE_SCMVERSION='
+
 for g in "$CFG_GKI" "$GKI_VENDOR"; do
   [ -f "$g" ] || die "找不到 $g"
+
+  # 3.6.1 关闭 LOCALVERSION_AUTO
   if grep -qxF "$VFLAG" "$g"; then
-    ok "${g#$KP/} 已关闭，跳过"
+    ok "${g#$KP/} LOCALVERSION_AUTO 已关闭"
   elif grep -qx 'CONFIG_LOCALVERSION_AUTO=y' "$g"; then
     awk '{ if ($0 == "CONFIG_LOCALVERSION_AUTO=y") print "# CONFIG_LOCALVERSION_AUTO is not set"; else print }' \
         "$g" > "$g.tmp" && mv "$g.tmp" "$g"
-    ok "${g#$KP/} 已改为 not set"
+    ok "${g#$KP/} LOCALVERSION_AUTO 已改为 not set"
   else
     printf '%s\n' "$VFLAG" >> "$g"
-    ok "${g#$KP/} 已追加 not set"
+    ok "${g#$KP/} 已追加 LOCALVERSION_AUTO not set"
+  fi
+
+  # 3.6.2 同步移除依赖它的 MODULE_SCMVERSION（不可见符号，必须删）
+  if grep -qE "$SCM_PAT" "$g"; then
+    n=$(grep -cE "$SCM_PAT" "$g")
+    awk -v p="$SCM_PAT" '$0 ~ p {next} {print}' "$g" > "$g.tmp" && mv "$g.tmp" "$g"
+    ok "${g#$KP/} 已删除 $n 行 MODULE_SCMVERSION（depends on LOCALVERSION_AUTO）"
+  else
+    ok "${g#$KP/} 无 MODULE_SCMVERSION，跳过"
   fi
 done
 
+# 3.6.3 校验
 for g in "$CFG_GKI" "$GKI_VENDOR"; do
-  grep -qxF "$VFLAG" "$g" || die "LOCALVERSION_AUTO 未关闭: $g"
+  grep -qxF "$VFLAG" "$g"        || die "LOCALVERSION_AUTO 未关闭: $g"
+  if grep -qE "$SCM_PAT" "$g"; then
+    die "MODULE_SCMVERSION 未删除: $g（会导致 check_merged_defconfig 输出 -符号 → 构建中止）"
+  fi
 done
-ok "PART 3.6 校验通过（两趟都不会追加 git 哈希）"
+ok "PART 3.6 校验通过（LOCALVERSION_AUTO 已关，MODULE_SCMVERSION 已同步移除）"
 
-# ===========================================================================
-# PART 4：ThinLTO 构建参数（不改文件）
-# ===========================================================================
 info "PART 4 / ThinLTO 构建参数"
 cat <<EOF
 --------------------------------------------------------------
