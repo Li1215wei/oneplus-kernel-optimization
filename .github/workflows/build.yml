@@ -93,10 +93,16 @@ jobs:
           repo sync -c -j8 --force-sync
           echo "=== 顶层 ==="; ls -la
           echo "=== 关键树 ==="
-          for p in kernel_platform/common kernel_platform/msm-kernel device/qcom/taro-kernel \
+          for p in kernel_platform/common kernel_platform/msm-kernel \
                    kernel_platform/prebuilts-master/clang/host/linux-x86; do
-            if [ -e "$p" ]; then echo "OK   $p"; else echo "::warning::缺失 $p"; fi
+            if [ -e "$p" ]; then echo "OK   $p"; else echo "::error::缺失 $p"; fi
           done
+          echo "=== device/qcom/taro-kernel（纯 boot 方案不需要；仅打包 img 时用） ==="
+          if [ -e device/qcom/taro-kernel ]; then
+            echo "  有   device/qcom/taro-kernel → 可产出 boot.img/vendor_boot.img/dtbo.img"
+          else
+            echo "  无   device/qcom/taro-kernel → 不会产出 boot.img 等，纯 boot 方案无影响"
+          fi
           echo "=== vendor/oplus（本 manifest 不含，属正常；构建不需要它） ==="
           ls -d vendor/oplus 2>/dev/null || echo "  (absent, expected)"
           for d in kernel_platform/common kernel_platform/msm-kernel; do
@@ -119,9 +125,13 @@ jobs:
             if [ -e "$p" ]; then echo "OK   $p"; else echo "::error::缺失 $p"; MISS=$((MISS+1)); fi
           done
 
-          # 非必需，但缺失会导致 vendor 趟 DTB/DTBO 失败 → 仅警告
+          # 纯 boot 方案不依赖从 device/qcom 打包 img；缺失仅说明无法产出 boot.img 等
           for p in k/device/qcom/taro-kernel k/vendor/qcom/proprietary; do
-            if [ -e "$p" ]; then echo "OK   $p"; else echo "::warning::缺失 $p（vendor 趟 dtbs 可能失败）"; fi
+            if [ -e "$p" ]; then
+              echo "OK   $p"
+            else
+              echo "  --   $p 不存在（纯 boot 方案不需要，跳过 img 打包）"
+            fi
           done
 
           echo "=== apply.sh 依赖的锚点 ==="
@@ -130,9 +140,27 @@ jobs:
           grep -c 'drbg_cores\[\] = {' k/kernel_platform/common/crypto/drbg.c || true
           grep -c 'ttwu_stat' k/kernel_platform/common/kernel/sched/core.c || true
 
-          echo "=== 省电减法目标符号存在性（PART 3.5 会删掉它们） ==="
-          grep -cE '^#? ?CONFIG_(BITS_TEST|LINEAR_RANGES_TEST) ' k/kernel_platform/common/arch/arm64/configs/consolidate.fragment || true
-          grep -cE '^CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO)=' k/kernel_platform/common/arch/arm64/configs/gki_defconfig || true
+          echo "=== 省电减法目标符号存在性（PART 3.5 只会删 DEBUG_INFO） ==="
+          echo -n "  DEBUG_INFO 行数(common): "
+          grep -cE '^#? ?CONFIG_DEBUG_INFO' k/kernel_platform/common/arch/arm64/configs/gki_defconfig || true
+          echo -n "  DEBUG_INFO 行数(msm):    "
+          grep -cE '^#? ?CONFIG_DEBUG_INFO' k/kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig || true
+          echo "  CRC 相关项（必须保留为 y）:"
+          for s in KASAN KASAN_HW_TAGS KFENCE PAGE_OWNER UBSAN LOCKDEP; do
+            v=$(grep -E "^CONFIG_${s}=y$" k/kernel_platform/common/arch/arm64/configs/gki_defconfig | head -1)
+            echo "    ${s}: ${v:-<未找到>}"
+          done
+
+          echo "=== PART 3.6 前置：LOCALVERSION_AUTO 的依赖符号 MODULE_SCMVERSION ==="
+          # common/init/Kconfig: MODULE_SCMVERSION 带 depends on LOCALVERSION_AUTO。
+          # 关闭 LOCALVERSION_AUTO 后它会变不可见符号，若不从 defconfig 一并删除，
+          # vendor 趟 check_merged_defconfig 会输出 "-MODULE_SCMVERSION y" 并以 exit 1 中止。
+          for f in k/kernel_platform/common/arch/arm64/configs/gki_defconfig \
+                   k/kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig; do
+            echo -n "  $(basename $(dirname $(dirname $(dirname $(dirname $f)))))/gki_defconfig: "
+            grep -E '^#? ?CONFIG_(LOCALVERSION_AUTO|MODULE_SCMVERSION)' "$f" | tr '\n' ' '
+            echo ""
+          done
 
           echo "=== boot.img 用的内核文件（KERNEL_BINARY） ==="
           grep -n 'KERNEL_BINARY' k/kernel_platform/msm-kernel/build.config.msm.common
@@ -230,8 +258,39 @@ jobs:
           for c in "${OUT}/gki_kernel/common/.config" "${OUT}/msm-kernel/.config"; do
             [ -f "$c" ] || continue
             echo "--- $(basename $(dirname $(dirname $c))) ---"
-            grep -E '^#? ?CONFIG_DEBUG_INFO(_DWARF4)?=' "$c" || echo "  (DEBUG_INFO 已删除)"
-            grep -E '^CONFIG_(KASAN|KFENCE|PAGE_OWNER|UBSAN|LOCKDEP)=' "$c" || echo "  ::error::CRC 相关项缺失"
+            grep -E '^#? ?CONFIG_DEBUG_INFO(_DWARF4)?=' "$c" || echo "  (DEBUG_INFO 已删除，符合预期)"
+            if grep -qE '^CONFIG_(KASAN|KFENCE|PAGE_OWNER|UBSAN|LOCKDEP)=' "$c"; then
+              echo "  OK: CRC 相关项保留"
+            else
+              echo "  ::error::CRC 相关项缺失，纯 boot 方案失效"; FAIL=$((FAIL+1))
+            fi
+          done
+
+          echo "=== C2) LOCALVERSION_AUTO / MODULE_SCMVERSION 一致性 ==="
+          # 二者是 depends on 关系：关掉前者若不删后者，vendor 趟
+          # check_merged_defconfig 会输出 "-MODULE_SCMVERSION y" → exit 1
+          for c in "${OUT}/gki_kernel/common/.config" "${OUT}/msm-kernel/.config"; do
+            [ -f "$c" ] || continue
+            LA=$(grep -cE '^CONFIG_LOCALVERSION_AUTO=y$' "$c" || true)
+            MS=$(grep -cE '^CONFIG_MODULE_SCMVERSION=y$' "$c" || true)
+            echo "--- $(basename $(dirname $(dirname $c))): LOCALVERSION_AUTO=$LA MODULE_SCMVERSION=$MS ---"
+            if [ "$LA" = "0" ] && [ "$MS" != "0" ]; then
+              echo "  ::error::LOCALVERSION_AUTO 已关但 MODULE_SCMVERSION 仍为 y（不可能共存，会构建失败）"
+              FAIL=$((FAIL+1))
+            else
+              echo "  OK: 二者一致"
+            fi
+          done
+          echo "--- 源 defconfig 中不应残留 MODULE_SCMVERSION ---"
+          for f in kernel_platform/common/arch/arm64/configs/gki_defconfig \
+                   kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig; do
+            if grep -qE '^#? ?CONFIG_MODULE_SCMVERSION=' "$f"; then
+              echo "  ::error::$f 仍残留 MODULE_SCMVERSION 行 —— 会导致 -MODULE_SCMVERSION 差异并中止构建"
+              grep -nE '^#? ?CONFIG_MODULE_SCMVERSION=' "$f"
+              FAIL=$((FAIL+1))
+            else
+              echo "  OK  $f 无残留"
+            fi
           done
 
           echo "=== D) 源码落盘 ==="
@@ -242,8 +301,10 @@ jobs:
           wc -l < kernel_platform/common/arch/arm64/configs/consolidate.fragment 2>/dev/null || echo 0
 
           echo "=== E) 产物列表 ==="
-          ls -lh "${OUT}/dist/" 2>/dev/null || echo "::error::dist 不存在"
-          ls -lh "${OUT}/gki_kernel/dist/" 2>/dev/null || echo "::error::gki_kernel/dist 不存在"
+          echo "--- dist（vendor 趟产物，纯 boot 方案可缺）---"
+          ls -lh "${OUT}/dist/" 2>/dev/null || echo "  (不存在，纯 boot 无需)"
+          echo "--- gki_kernel/dist（GKI 趟产物，Image 在这里）---"
+          ls -lh "${OUT}/gki_kernel/dist/" 2>/dev/null || echo "  ::error::gki_kernel/dist 不存在（Image 无法产出）"
 
           echo "=== F) Image 体积（保留插桩，应与基线 ~57MB 接近，而非 39MB）==="
           IMG="${OUT}/gki_kernel/dist/Image"
@@ -254,16 +315,28 @@ jobs:
               echo "::warning::Image 明显小于基线（57MB），说明插桩可能被误删，CRC 会变"
             fi
           else
-            echo "::error::Image 缺失"; FAIL=$((FAIL+1))
+            echo "::error::Image 缺失（纯 boot 方案的核心产物，不可缺失）"; FAIL=$((FAIL+1))
           fi
 
-          echo "=== G) boot 相关产物（纯 boot 只需 boot.img + vendor_boot.img + dtbo.img）==="
-          for f in boot.img vendor_boot.img dtbo.img; do
-            if [ -s "${OUT}/dist/$f" ]; then echo "OK  $f ($(du -h "${OUT}/dist/$f" | cut -f1))";
-            else echo "::error::$f 缺失"; FAIL=$((FAIL+1)); fi
-          done
+          echo "=== G) 纯 boot 方案只需 Image；其余产物均为可选 ==="
+          # 纯 boot：AK3 用 gki_kernel/dist/Image 自行组装 boot，
+          # 不需要 dist/boot.img、vendor_boot.img、dtbo.img。
+          # 这三个文件由 vendor 趟产出，而 vendor 趟依赖 device/qcom/taro-kernel；
+          # 该目录缺失时它们不会生成，属于环境问题，不应判本方案失败。
           for f in Image Image.lz4 System.map vmlinux; do
-            if [ -s "${OUT}/gki_kernel/dist/$f" ]; then echo "OK  $f"; else echo "::error::$f 缺失"; FAIL=$((FAIL+1)); fi
+            if [ -s "${OUT}/gki_kernel/dist/$f" ]; then
+              echo "OK   gki_kernel/dist/$f"
+            else
+              echo "::error::gki_kernel/dist/$f 缺失"; FAIL=$((FAIL+1))
+            fi
+          done
+          echo "--- 可选产物（缺失不判失败，仅提示）---"
+          for f in boot.img vendor_boot.img dtbo.img; do
+            if [ -s "${OUT}/dist/$f" ]; then
+              echo "  有   dist/$f ($(du -h "${OUT}/dist/$f" | cut -f1))"
+            else
+              echo "  无   dist/$f —— 纯 boot 方案不需要，跳过"
+            fi
           done
 
           if [ "$FAIL" -ne 0 ]; then echo "::error::共 $FAIL 项校验失败"; exit 1; fi
@@ -337,15 +410,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload kernel images (raw)
+      - name: Upload GKI images (required)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-images-${{ env.VARIANT }}-${{ env.LTO_MODE }}-lean${{ env.POWER_LEAN }}
+          name: gki-images-${{ env.VARIANT }}-${{ env.LTO_MODE }}-lean${{ env.POWER_LEAN }}
           path: |
-            k/kernel_platform/out/*/dist/*.img
-            k/kernel_platform/out/*/dist/*.tar.gz
-            k/kernel_platform/out/*/dist/Module.symvers
             k/kernel_platform/out/*/gki_kernel/dist/Image
             k/kernel_platform/out/*/gki_kernel/dist/Image.lz4
             k/kernel_platform/out/*/gki_kernel/dist/System.map
@@ -353,6 +423,18 @@ jobs:
             k/kernel_platform/out/*/gki_kernel/dist/modules.builtin*
             k/kernel_platform/out/*/gki_kernel/dist/abi.*
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload vendor dist images (optional - pure boot mode ignores these)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-dist-${{ env.VARIANT }}-${{ env.LTO_MODE }}-lean${{ env.POWER_LEAN }}
+          path: |
+            k/kernel_platform/out/*/dist/*.img
+            k/kernel_platform/out/*/dist/*.tar.gz
+            k/kernel_platform/out/*/dist/Module.symvers
+          if-no-files-found: warn
           retention-days: 14
 
       - name: Upload logs
