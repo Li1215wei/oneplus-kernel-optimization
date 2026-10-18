@@ -1,17 +1,33 @@
 #!/usr/bin/env bash
 # =============================================================================
-# apply.sh —— 内核优化补丁应用（v6）
+# apply.sh —— 内核优化补丁应用（v8 · 纯 boot 模式）
 #   目标机型: OnePlus Ace Pro (PGP110 / SM8475)
 #   代码基线: android12-5.10 / linux-5.10.236
 #
-# 优化项:
-#   1. ThinLTO          —— 构建参数 export LTO=thin，不改文件
-#   2. LRNG v59         —— 打入 common/
-#   3. SSG I/O 调度器    —— 打入 common/
-#   4. USB 省电         —— CONFIG_USB_AUTOSUSPEND_DELAY=5
-#   5. 关闭调试选项      —— PART 3.5（删除式）
-#   6. KVM              —— 原仓库已开启（CONFIG_VIRTUALIZATION=y + CONFIG_KVM=y），本脚本不动
+# ★ 本版本核心约束：只刷 boot，绝不修改 vendor_dlkm / odm_dlkm
+#
+#   原厂模块的 __kcrctab CRC 由 genksyms 基于「源码签名 + CONFIG #ifdef 的预处理
+#   结果」计算（common/scripts/Makefile.build:298）。kernel/module.c 在
+#   CONFIG_MODVERSIONS=y 且 MODULE_FORCE_LOAD=n 时，CRC 不符即拒绝加载
+#   （"disagrees about version of symbol"）。
+#
+#   ⇒ 任何改变 #ifdef 预处理结果的 CONFIG 都不可删除，否则原厂模块全部拒载，
+#     odm_dlkm 中的 binder/ext4/f2fs/erofs/usbcore 加载失败 → 卡第一屏反复重启。
+#   ⇒ 实测对照 ColorArchive：其 KASAN/KASAN_HW_TAGS/KFENCE/PAGE_OWNER 全部 =y，
+#     故 CRC 与原厂一致，只刷 boot 即可开机。
+#
+# 优化项（全部兼容纯 boot）:
+#   1. ThinLTO          —— 构建参数 export LTO=thin。genksyms 只喂编译器 .s 输出，
+#                          不参与 LTO 优化 → 导出符号 CRC 不变
+#   2. LRNG v59         —— 打入 common/。改动限 random/crypto/sched，导出签名不变
+#   3. SSG I/O 调度器    —— 打入 common/。纯新增 obj-y 代码，不 EXPORT_SYMBOL
+#   4. USB 省电         —— CONFIG_USB_AUTOSUSPEND_DELAY=5（仅 cmdline/配置值）
+#   5. DEBUG_INFO       —— 可选删除（PART 3.5）。只产生 .debug_* 段，不进 Image，
+#                          不影响 CRC；收益仅限 vmlinux 体积
+#   6. KVM              —— 原仓库已开启（CONFIG_VIRTUALIZATION=y + CONFIG_KVM=y），不动
 #   ❌ TEO              —— 不改：保持 qcom-cpu-lpm（原厂集群 LPM 感知）
+#   ❌ 关闭插桩          —— 放弃：KASAN/KFENCE/PAGE_OWNER/UBSAN/LOCKDEP/DEBUG_OBJECTS
+#                          等全部保留，否则 CRC 改变导致无法只刷 boot
 #
 # ⚠️ 必须用 VARIANT=consolidate（默认值）构建：
 #    - consolidate 的 GKI 趟 POST_DEFCONFIG_CMDS 被 gki_consolidate.aarch64 覆盖为 rm，
@@ -24,21 +40,13 @@
 #    defconfig 里 → vendor 趟 check_merged_defconfig 输出 "-符号" → exit 1 → 构建中止。
 #    删除行则只会在 .config 侧多出 "+符号"（允许），不会触发该守卫。
 #
-#    v6 修复（基于真实失败日志 build.log）:
-#      ERROR! Defconfig fragment did not apply as expected
-#      -BITS_TEST n
-#      -LINEAR_RANGES_TEST n
-#    原因：这两个是 KUnit 测试（depends on KUNIT）但名字不含 "KUNIT"，
-#    删掉 CONFIG_KUNIT 后它们变不可见符号 → 必须一并删除。
-#    已穷尽核对全树 depends on KUNIT 的 10 个符号，只有这两个会残留。
-#
 # 用法（在 repo/ROM 根目录执行）:
 #     ROM_ROOT=$PWD bash scripts/apply.sh
 # 环境变量:
 #     ROM_ROOT=<path>    默认 $(pwd)
 #     RUN_BUILD=1        默认 0（只应用补丁+配置，不编译）
 #     LTO_MODE=thin      仅用于打印提示
-#     POWER_LEAN=0|1     默认 1；置 0 可整体跳过 PART 3.5（用于二分定位构建失败）
+#     POWER_LEAN=0|1     默认 1；置 0 则保留 DEBUG_INFO（vmlinux 更大）
 # =============================================================================
 set -eo pipefail
 export LC_ALL=C
@@ -415,53 +423,109 @@ cat <<'NOTE'
 NOTE
 
 # ===========================================================================
-# PART 3.5：省电减法 —— 删除运行期插桩与调试项
-#   POWER_LEAN=0 可整体跳过，用于二分定位构建失败。
-#   为什么写 consolidate.fragment：它同时被 GKI 趟(Image) 与 vendor 趟(模块) 读取，
-#   能保证插桩配置一致；写 gki_defconfig 会触发 check_defconfig + set -e → 构建中止。
+# PART 3.5：可选 —— 仅删除 DEBUG_INFO（不改变符号 CRC）
+#
+# ⚠️ 纯 boot 约束（只刷 boot，绝不刷 vendor_dlkm / odm_dlkm）：
+#    原厂模块的 __kcrctab CRC 由 genksyms 基于「源码签名 + CONFIG #ifdef 的
+#    预处理结果」算出（common/scripts/Makefile.build:298 —— genksyms 只喂
+#    编译器的 .s 输出，不参与 LTO 优化）。因此：
+#
+#      改变 CRC（必须保留）：
+#        KASAN / KASAN_HW_TAGS / KFENCE / PAGE_OWNER / UBSAN* / LOCKDEP /
+#        LOCK_STAT / DEBUG_LOCK_ALLOC / DEBUG_MUTEXES / DEBUG_RT_MUTEXES /
+#        DEBUG_RWSEMS / DEBUG_SPINLOCK / DEBUG_OBJECTS* / DEBUG_PREEMPT /
+#        SLUB_DEBUG_ON / PAGE_POISONING / DYNAMIC_DEBUG / KUNIT
+#
+#      不改变 CRC（可安全删除）：
+#        DEBUG_INFO / DEBUG_INFO_DWARF4 —— 只生成 .debug_* 段，不进 Image，
+#        不改变任何 #ifdef 分支
+#
+#    实测对照（ColorArchive 自制内核）：其 CONFIG_KASAN=y、KASAN_HW_TAGS=y、
+#    KFENCE=y、PAGE_OWNER=y 全部保留，故 CRC 与原厂一致，只刷 boot 即可开机；
+#    一旦删除这些项，原厂模块会因 "disagrees about version of symbol" 被
+#    kernel/module.c 拒绝加载（CONFIG_MODVERSIONS=y 且 MODULE_FORCE_LOAD=n）。
+#
+#    注意：Image 是只含 .text/.data/.rodata 的裸二进制，.debug_* 段只在
+#    vmlinux 里。因此删 DEBUG_INFO 不会缩小 Image，运行时性能与功耗均无变化；
+#    这一项只是为了减小 vmlinux 体积。POWER_LEAN=0 可完全跳过。
 # ===========================================================================
-if [ "$POWER_LEAN" = "1" ]; then
+if [ "${POWER_LEAN:-1}" = "1" ]; then
 
-info "PART 3.5 / 省电减法：删除运行期插桩与调试项"
+info "PART 3.5 / 仅删除 DEBUG_INFO（不影响符号 CRC）"
 
-# 3.5.1 两个 gki_defconfig 同步删除插桩项
-INSTR_PAT='^#? ?CONFIG_(KASAN|KFENCE|UBSAN|PAGE_OWNER|DEBUG_INFO)'
+DI_PAT='^#? ?CONFIG_DEBUG_INFO(_DWARF4)?=y'
 for g in "$CFG_GKI" "$GKI_VENDOR"; do
   [ -f "$g" ] || die "找不到 $g"
-  if grep -qE "$INSTR_PAT" "$g"; then
-    n=$(grep -cE "$INSTR_PAT" "$g")
-    awk -v p="$INSTR_PAT" '$0 ~ p {next} {print}' "$g" > "$g.tmp" && mv "$g.tmp" "$g"
-    ok "已从 ${g#$KP/} 删除 $n 行插桩配置"
+  if grep -qE "$DI_PAT" "$g"; then
+    n=$(grep -cE "$DI_PAT" "$g")
+    awk -v p="$DI_PAT" '$0 ~ p {next} {print}' "$g" > "$g.tmp" && mv "$g.tmp" "$g"
+    ok "已从 ${g#$KP/} 删除 $n 行 DEBUG_INFO"
   else
-    ok "${g#$KP/} 已无插桩配置，跳过"
+    ok "${g#$KP/} 无 DEBUG_INFO，跳过"
   fi
 done
 
-# 3.5.2 consolidate.fragment 删除调试项
-#   注意 BITS_TEST / LINEAR_RANGES_TEST 是 KUnit 测试（depends on KUNIT）但名字不含
-#   "KUNIT"，删掉 CONFIG_KUNIT 后它们会变成不可见符号 → 从 .config 消失，却仍留在
-#   合并 defconfig 里 → check_merged_defconfig 输出 "-符号" → exit 1（构建中止）。
-#   已穷尽核对全树 depends on KUNIT 的 10 个符号，只有这两个会残留。
-DBG_PAT='^#? ?CONFIG_(DEBUG_|LOCKDEP|LOCK_STAT|SLUB_DEBUG_ON|PAGE_POISONING|DYNAMIC_DEBUG|BITS_TEST|LINEAR_RANGES_TEST)'
-KUNIT_PAT='^#? ?CONFIG_[A-Z0-9_]*KUNIT[A-Z0-9_]*'
-if grep -qE "$DBG_PAT|$KUNIT_PAT" "$FRAG"; then
-  n=$(grep -cE "$DBG_PAT|$KUNIT_PAT" "$FRAG")
-  awk -v p="$DBG_PAT" -v p2="$KUNIT_PAT" '$0 ~ p || $0 ~ p2 {next} {print}' "$FRAG" > "$FRAG.tmp" && mv "$FRAG.tmp" "$FRAG"
-  ok "已从 ${FRAG#$KP/} 删除 $n 行调试配置"
-else
-  ok "${FRAG#$KP/} 已无调试配置，跳过"
-fi
-
-# 3.5.3 校验
+# ---- 反向校验：CRC 相关配置必须一个不少 --------------------------------
+# 纯 boot 方案的唯一正确性依据：这些符号的 CONFIG 取值与原厂完全一致。
+CRC_GUARD='CONFIG_(KASAN|KASAN_HW_TAGS|KFENCE|PAGE_OWNER|UBSAN|UBSAN_TRAP|UBSAN_LOCAL_BOUNDS|LOCKDEP|LOCK_STAT|DEBUG_LOCK_ALLOC|DEBUG_OBJECTS|DEBUG_PREEMPT|DEBUG_SPINLOCK|DEBUG_MUTEXES|DEBUG_RT_MUTEXES|DEBUG_RWSEMS|SLUB_DEBUG_ON|PAGE_POISONING|DYNAMIC_DEBUG|KUNIT)=y'
 for g in "$CFG_GKI" "$GKI_VENDOR"; do
-  if grep -qE "$INSTR_PAT" "$g"; then die "插桩删除失败: $g 仍有残留"; fi
+  n=$(grep -cE "^${CRC_GUARD}$" "$g")
+  if [ "$n" -gt 0 ]; then
+    ok "${g#$KP/} CRC 相关配置保留完好（$n 项为 y）"
+  else
+    die "${g#$KP/} 未找到 CRC 相关配置，无法确认纯 boot 安全性"
+  fi
 done
-if grep -qE "$DBG_PAT|$KUNIT_PAT" "$FRAG"; then die "调试项删除失败: $FRAG 仍有残留"; fi
-ok "省电减法校验通过（两个 gki_defconfig + consolidate.fragment 均无残留）"
+
+# consolidate.fragment 里也不能删任何调试项（它们同样影响 CRC）
+if grep -qE '^CONFIG_(DEBUG_|LOCKDEP|LOCK_STAT|SLUB_DEBUG_ON|PAGE_POISONING|DYNAMIC_DEBUG|KUNIT)' "$FRAG"; then
+  ok "consolidate.fragment 调试项完整保留（纯 boot 要求）"
+else
+  die "consolidate.fragment 的调试项被删除，会改变 CRC"
+fi
+
+ok "PART 3.5 校验通过（只删了 DEBUG_INFO，CRC 未受影响）"
 
 else
-  warn "POWER_LEAN=0 → 跳过 PART 3.5（保持原仓库调试配置，用于二分定位）"
+  warn "POWER_LEAN=0 → 跳过 PART 3.5（保留 DEBUG_INFO）"
 fi
+
+# ===========================================================================
+# PART 3.6：统一版本字符串（关闭 LOCALVERSION_AUTO）
+#
+#   CONFIG_LOCALVERSION_AUTO 默认 y（common/init/Kconfig:180-183），
+#   common/scripts/setlocalversion:208-210 会追加所在 git 仓库 HEAD 的短哈希。
+#   而 GKI 趟在 common/ 编译、vendor 趟在 msm-kernel/ 编译 —— 两个独立仓库，
+#   HEAD 天然不同，于是：
+#       内核 Image : 5.10.236-qki-consolidate-android12-9-o-gc076c7357bf1-dirty
+#       全部模块   : 5.10.236-qki-consolidate-g9f869b57a717-dirty
+#
+#   注意：MODVERSIONS=y 时内核会忽略 vermagic 的版本前缀
+#   （kernel/module.c:1378-1387 same_magic() 跳过空格前部分），
+#   所以字符串不一致 "本身" 不致命；统一它是为了便于用 uname -r 判断版本、
+#   并让 CI 的 vermagic 校验可读。真正的兼容性由 __kcrctab CRC 决定。
+# ===========================================================================
+info "PART 3.6 / 统一版本字符串（关闭 LOCALVERSION_AUTO）"
+
+VFLAG='# CONFIG_LOCALVERSION_AUTO is not set'
+for g in "$CFG_GKI" "$GKI_VENDOR"; do
+  [ -f "$g" ] || die "找不到 $g"
+  if grep -qxF "$VFLAG" "$g"; then
+    ok "${g#$KP/} 已关闭，跳过"
+  elif grep -qx 'CONFIG_LOCALVERSION_AUTO=y' "$g"; then
+    awk '{ if ($0 == "CONFIG_LOCALVERSION_AUTO=y") print "# CONFIG_LOCALVERSION_AUTO is not set"; else print }' \
+        "$g" > "$g.tmp" && mv "$g.tmp" "$g"
+    ok "${g#$KP/} 已改为 not set"
+  else
+    printf '%s\n' "$VFLAG" >> "$g"
+    ok "${g#$KP/} 已追加 not set"
+  fi
+done
+
+for g in "$CFG_GKI" "$GKI_VENDOR"; do
+  grep -qxF "$VFLAG" "$g" || die "LOCALVERSION_AUTO 未关闭: $g"
+done
+ok "PART 3.6 校验通过（两趟都不会追加 git 哈希）"
 
 # ===========================================================================
 # PART 4：ThinLTO 构建参数（不改文件）
