@@ -58,7 +58,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bison flex libssl-dev bc cpio rsync python3 python-is-python3 \
-            lz4 xz-utils zip unzip git curl build-essential libelf-dev dwarves
+            lz4 xz-utils zip unzip git curl build-essential libelf-dev dwarves \
+            binutils-aarch64-linux-gnu
           zip -v | head -2
 
       - name: Checkout workflow repo
@@ -139,13 +140,31 @@ jobs:
           #   （实测：2026-10-23 那次构建就是栽在这里）
           export ARCH=arm64
           export LLVM=1
-          export LLVM_IAS=1
+          # ★ 关键：不使用 clang 集成汇编器。
+          #   arch/arm64/kvm/hyp/nvhe/gen-hyprel.c:340 生成的
+          #     .reloc <off>, R_AARCH64_PREL32, <sym> + <off>
+          #   在 LLVM_IAS=1 下会失败（实测两种形态都报错）：
+          #     符号名 → "unknown relocation name"
+          #     数字   → "expected relocation name"
+          #   改用 GNU as（aarch64-linux-gnu-as）后原生支持该语法。
+          export LLVM_IAS=0
           export CROSS_COMPILE=aarch64-linux-gnu-
+          # 装了 binutils 后 common/Makefile:592 会把 GCC_TOOLCHAIN_DIR 解析成
+          # /usr/bin/，进而 GCC_TOOLCHAIN=/usr 并追加 --gcc-toolchain=/usr；
+          # 而 /usr 下并没有 aarch64 的 GCC 安装（--prefix 已够用）。
+          # 这里把 GCC_TOOLCHAIN 置空，跳过 --gcc-toolchain。
+          export GCC_TOOLCHAIN=
           # 官方 common/build.config.aarch64:5 也设了 compat 交叉前缀；
           # gki_defconfig 里 CONFIG_COMPAT=y，vc 兼容层可能用到 32 位工具链
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
           echo "=== 工具链自检 ==="
+          echo "AS  : $(command -v aarch64-linux-gnu-as || echo '❌ 未找到')"
+          aarch64-linux-gnu-as --version | head -1 || true
+          if ! command -v aarch64-linux-gnu-as >/dev/null; then
+            echo "::error::缺少 aarch64-linux-gnu-as（GNU as），无法汇编 hyp-reloc.S"
+            exit 1
+          fi
           clang --target=aarch64-linux-gnu -print-target-triple
           TMPD=$(mktemp -d)
           printf 'register unsigned long sp asm("sp");\nunsigned long f(void){return sp;}\n' > "$TMPD/t.c"
@@ -157,9 +176,10 @@ jobs:
           file "$TMPD/t.o" || true
           echo "✅ 工具链能为 aarch64 生成目标文件"
 
-          MAKE_ARGS=(O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+          MAKE_ARGS=(O=out ARCH=arm64 LLVM=1 LLVM_IAS=0 \
                      CROSS_COMPILE=aarch64-linux-gnu- \
-                     CROSS_COMPILE_COMPAT=arm-linux-gnueabi-)
+                     CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+                     GCC_TOOLCHAIN=)
 
           echo "=== defconfig ==="
           make "${MAKE_ARGS[@]}" gki_defconfig
