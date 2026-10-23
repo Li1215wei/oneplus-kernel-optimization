@@ -126,10 +126,38 @@ jobs:
           export PATH="$PWD/../prebuilts-master/clang/host/linux-x86/${CLANG_BIN}:$PATH"
           echo "CLANG: $(command -v clang)"; clang --version | head -2
 
-          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+          # ★ 必须导出 CROSS_COMPILE：
+          #   common/Makefile:589-591
+          #     ifneq ($(CROSS_COMPILE),)
+          #     CLANG_FLAGS += --target=$(notdir $(CROSS_COMPILE:%-=%))
+          #   CROSS_COMPILE 为空时不会追加 --target，clang 就按【宿主 x86_64】编译，
+          #   于是报：
+          #     arch/arm64/include/asm/stack_pointer.h:8: error:
+          #       register 'sp' unsuitable for global register variables
+          #     arch/arm64/include/asm/kgdb.h:21: error:
+          #       value '1025' out of range for constraint 'I'
+          #   （实测：2026-10-23 那次构建就是栽在这里）
+          export ARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          echo "=== 工具链自检 ==="
+          clang --target=aarch64-linux-gnu -print-target-triple
+          TMPD=$(mktemp -d)
+          printf 'register unsigned long sp asm("sp");\nunsigned long f(void){return sp;}\n' > "$TMPD/t.c"
+          if ! clang --target=aarch64-linux-gnu -c "$TMPD/t.c" -o "$TMPD/t.o" 2>"$TMPD/err"; then
+            echo "::error::clang 无法为 aarch64 编译（register sp 测试失败）"
+            cat "$TMPD/err"
+            exit 1
+          fi
+          file "$TMPD/t.o" || true
+          echo "✅ 工具链能为 aarch64 生成目标文件"
+
+          MAKE_ARGS=(O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-)
 
           echo "=== defconfig ==="
-          make O=out ${ARCH:+"ARCH=$ARCH"} LLVM=1 LLVM_IAS=1 gki_defconfig
+          make "${MAKE_ARGS[@]}" gki_defconfig
 
           echo "=== LTO = ${LTO_MODE} ==="
           if [ "${LTO_MODE}" = "thin" ]; then
@@ -137,10 +165,10 @@ jobs:
           else
             scripts/config --file out/.config -e LTO_CLANG -e LTO_CLANG_FULL -d LTO_CLANG_THIN -d LTO_CLANG_NONE
           fi
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          make "${MAKE_ARGS[@]}" olddefconfig
 
           echo "=== 只构建 Image（不构建模块，不需要 vendor 趟）==="
-          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image 2>&1 | tee build.log
+          make -j"$(nproc --all)" "${MAKE_ARGS[@]}" Image 2>&1 | tee build.log
 
           ls -lh out/arch/arm64/boot/Image
 
