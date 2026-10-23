@@ -1,0 +1,277 @@
+name: Build GKI Kernel (pure boot) + AnyKernel3
+
+# =============================================================================
+# 本工作流依据可工作的参考实现（Li1215wei/Action-Build）重写，核心差别：
+#
+#   ① 只构建 GKI 趟（common/），用 plain make + gki_defconfig
+#      —— 不跑 prepare_vendor.sh / build.sh / mixed build
+#      —— 因此不产 boot.img / vendor_dlkm.img / super.img，也不需要 device/qcom
+#
+#   ② 绝不叠加 consolidate.fragment
+#      consolidate.fragment 会把 LOCKDEP / LOCK_STAT / DEBUG_LOCK_ALLOC /
+#      DEBUG_OBJECTS / DEBUG_SPINLOCK / DEBUG_PREEMPT / DEBUG_MUTEXES /
+#      DEBUG_RWSEMS / SLUB_DEBUG_ON / PAGE_POISONING 置 y。
+#      这些项改变结构体布局（struct lockdep_map / struct lock / timer_list），
+#      使内核导出符号 __kcrctab CRC 全部变化；而设备上的原厂 vendor_dlkm /
+#      odm_dlkm 模块是按官方 GKI 的 CRC 编译的，CONFIG_MODVERSIONS=y 且
+#      MODULE_FORCE_LOAD=n 时会因 "disagrees about version of symbol" 拒载
+#      → 卡 OnePlus logo 后反复重启。
+#
+#   ③ 只把 Image 塞进 AnyKernel3，由 AK3 在设备上从现有 boot 提取 ramdisk 重打包
+#      —— 这是能开机且不改其他分区的关键
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      lto:
+        description: 'LTO mode'
+        required: true
+        default: 'thin'
+        type: choice
+        options: [thin, full]
+
+env:
+  LC_ALL: C
+  LANG: C
+  TZ: UTC
+  LTO_MODE: ${{ github.event.inputs.lto || 'thin' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 16384
+          temp-reserve-mb: 4096
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libssl-dev bc cpio rsync python3 python-is-python3 \
+            lz4 xz-utils zip unzip git curl build-essential libelf-dev dwarves
+          zip -v | head -2
+
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install repo tool
+        run: |
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: Configure git
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global --add safe.directory '*'
+
+      - name: Verify workflow repo files
+        run: |
+          ls -la "$GITHUB_WORKSPACE"
+          test -f "$GITHUB_WORKSPACE/scripts/apply-gki.sh"  || echo "::error::scripts/apply-gki.sh 缺失"
+          test -f "$GITHUB_WORKSPACE/scripts/anykernel.sh"  || echo "::error::scripts/anykernel.sh 缺失"
+          test -f "$GITHUB_WORKSPACE/manifest/oneplus_10t.xml" || echo "::warning::manifest/oneplus_10t.xml 缺失"
+
+      - name: Init & sync source
+        run: |
+          mkdir k && cd k
+          repo init -u https://github.com/${{ github.repository }}.git \
+                    -m manifest/oneplus_10t.xml --depth=1
+          repo sync -c -j8 --force-sync
+          echo "=== 关键树检查（GKI-only 只需 common + prebuilts）==="
+          MISS=0
+          for p in kernel_platform/common \
+                   kernel_platform/prebuilts-master/clang/host/linux-x86; do
+            if [ -e "$p" ]; then echo "OK   $p"; else echo "::error::缺失 $p"; MISS=$((MISS+1)); fi
+          done
+          echo "=== 不需要的树（缺失属正常）==="
+          for p in device/qcom vendor/oplus; do
+            [ -e "$p" ] && echo "  有 $p（GKI-only 用不到）" || echo "  无 $p（正常）"
+          done
+          [ "$MISS" -eq 0 ] || exit 1
+
+      - name: Apply patches (SSG + LRNG + config, CRC-safe)
+        run: |
+          set -e
+          cp "$GITHUB_WORKSPACE/scripts/apply-gki.sh" /tmp/apply-gki.sh
+          chmod +x /tmp/apply-gki.sh
+          cd k
+          ROM_ROOT="$PWD" bash /tmp/apply-gki.sh 2>&1 | tee apply.log
+
+      - name: Build kernel (plain make, gki_defconfig)
+        run: |
+          set -euo pipefail
+          cd k/kernel_platform/common
+
+          CLANG_BIN="$(cd ../prebuilts-master/clang/host/linux-x86 2>/dev/null && ls -d clang-r*/bin 2>/dev/null | head -1)"
+          if [ -z "${CLANG_BIN:-}" ]; then
+            echo "::error::找不到 prebuilts-master/clang/host/linux-x86/clang-r*/bin"
+            ls -la ../prebuilts-master/clang/host/linux-x86 2>/dev/null || true
+            exit 1
+          fi
+          export PATH="$PWD/../prebuilts-master/clang/host/linux-x86/${CLANG_BIN}:$PATH"
+          echo "CLANG: $(command -v clang)"; clang --version | head -2
+
+          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+
+          echo "=== defconfig ==="
+          make O=out ${ARCH:+"ARCH=$ARCH"} LLVM=1 LLVM_IAS=1 gki_defconfig
+
+          echo "=== LTO = ${LTO_MODE} ==="
+          if [ "${LTO_MODE}" = "thin" ]; then
+            scripts/config --file out/.config -e LTO_CLANG -e LTO_CLANG_THIN -d LTO_CLANG_FULL -d LTO_CLANG_NONE
+          else
+            scripts/config --file out/.config -e LTO_CLANG -e LTO_CLANG_FULL -d LTO_CLANG_THIN -d LTO_CLANG_NONE
+          fi
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+
+          echo "=== 只构建 Image（不构建模块，不需要 vendor 趟）==="
+          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image 2>&1 | tee build.log
+
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Verify (CRC safety + optimizations + Image)
+        if: always()
+        run: |
+          cd k/kernel_platform/common || exit 0
+          FAIL=0
+          CFG=out/.config
+
+          echo "=== A) Image ==="
+          IMG=out/arch/arm64/boot/Image
+          if [ -s "$IMG" ]; then
+            SZ=$(stat -c %s "$IMG")
+            echo "Image = ${SZ} bytes ($((SZ/1024/1024)) MB)"
+          else
+            echo "::error::Image 缺失"; FAIL=$((FAIL+1))
+          fi
+
+          echo "=== B) ★ CRC 安全校验（决定能否只刷 boot）★ ==="
+          # 必须 =y（官方 gki_defconfig 就是 y，去掉会改变插桩布局）
+          for c in KASAN; do
+            if grep -qx "CONFIG_${c}=y" "$CFG"; then echo "OK  CONFIG_${c}=y"; else
+              echo "::error::CONFIG_${c} 不是 y —— 与官方 GKI 不一致"; FAIL=$((FAIL+1)); fi
+          done
+          # 必须 ≠y（这些会改变 struct 布局 → CRC 变化 → 原厂模块拒载）
+          for c in LOCKDEP LOCK_STAT DEBUG_LOCK_ALLOC DEBUG_OBJECTS DEBUG_SPINLOCK \
+                   DEBUG_PREEMPT DEBUG_MUTEXES DEBUG_RWSEMS SLUB_DEBUG_ON PAGE_POISONING; do
+            if grep -qx "CONFIG_${c}=y" "$CFG"; then
+              echo "::error::CONFIG_${c}=y —— 结构体布局会变，原厂模块将拒载"; FAIL=$((FAIL+1))
+            fi
+          done
+          echo "CRC 敏感项检查完成（应为 0 个 error）"
+
+          echo "=== C) 优化项是否进入配置 ==="
+          for c in LRNG MQ_IOSCHED_SSG MQ_IOSCHED_SSG_CGROUP USB_AUTOSUSPEND_DELAY \
+                   VIRTUALIZATION KVM LTO_CLANG LTO_CLANG_THIN CFI_CLANG; do
+            grep -E "^(CONFIG_${c}=|# CONFIG_${c} is not set)" "$CFG" || echo "  (无 CONFIG_${c})"
+          done
+
+          echo "=== D) LTO 实际模式 ==="
+          grep -E '^CONFIG_LTO_CLANG_(THIN|FULL|NONE)=y' "$CFG" || echo "  (LTO 相关行未找到)"
+
+          echo "=== E) LRNG / SSG 是否编译进 Image ==="
+          if [ -s out/System.map ]; then
+            echo -n "  lrng_ 符号数: "; grep -ac ' lrng_' out/System.map || true
+            echo -n "  ssg_  符号数: "; grep -ac ' ssg_'  out/System.map || true
+            if ! grep -aq 'lrng_es_mgr' out/System.map; then
+              echo "::error::System.map 中没有 LRNG 符号"; FAIL=$((FAIL+1))
+            fi
+            if ! grep -aq 'ssg_iosched\|ssg_init_queue' out/System.map; then
+              echo "::error::System.map 中没有 SSG 符号"; FAIL=$((FAIL+1))
+            fi
+          else
+            echo "::warning::System.map 不存在，跳过符号检查"
+          fi
+
+          echo "=== F) 构建日志错误 ==="
+          grep -nE '^make.*Error|Error [0-9]+|\*\*\*' build.log 2>/dev/null | head -20 || true
+
+          if [ "$FAIL" -ne 0 ]; then echo "::error::共 $FAIL 项校验失败"; exit 1; fi
+          echo "全部校验通过 ✅"
+
+      - name: Package AnyKernel3 (Image only)
+        if: always()
+        run: |
+          set -euo pipefail
+          cd k/kernel_platform/common
+          IMG=out/arch/arm64/boot/Image
+          if [ ! -s "$IMG" ]; then echo "::error::Image 缺失，无法打包"; exit 1; fi
+
+          echo "=== 拉取 AK3 模板 ==="
+          rm -rf /tmp/ak3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/ak3
+          rm -rf /tmp/ak3/.git /tmp/ak3/README.md
+          rm -f /tmp/ak3/Image* /tmp/ak3/zImage* /tmp/ak3/dzImage /tmp/ak3/boot.img
+
+          echo "=== 放入 Image（唯一载荷；ramdisk/cmdline 由 AK3 从设备现有 boot 提取）==="
+          cp "$IMG" /tmp/ak3/Image
+          ls -lh /tmp/ak3/Image
+
+          echo "=== 写入定制 anykernel.sh ==="
+          cp "$GITHUB_WORKSPACE/scripts/anykernel.sh" /tmp/ak3/anykernel.sh
+
+          echo "=== 打包 ==="
+          cd /tmp/ak3
+          ZIP_NAME="PGP110-GKI-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "$ZIP_NAME" anykernel.sh META-INF tools Image
+          cp "$ZIP_NAME" "$GITHUB_WORKSPACE/"
+          unzip -l "$ZIP_NAME" | head -25
+          ls -lh "$ZIP_NAME"
+
+          echo "=== 硬校验：只能有 Image，不能有任何分区镜像 ==="
+          for need in anykernel.sh META-INF/com/google/android/update-binary Image; do
+            unzip -l "$ZIP_NAME" | grep -q "$need" || { echo "::error::缺少 $need"; exit 1; }
+          done
+          for forbid in boot.img vendor_boot.img dtbo.img vendor_dlkm.img odm_dlkm.img super.img; do
+            if unzip -l "$ZIP_NAME" | grep -q "$forbid"; then
+              echo "::error::不应包含 $forbid"; exit 1
+            fi
+          done
+          echo "AK3 包正确（纯 Image）✅"
+
+      - name: Upload AnyKernel3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anykernel3-gki-${{ env.LTO_MODE }}
+          path: ${{ github.workspace }}/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Image + System.map
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-image-${{ env.LTO_MODE }}
+          path: |
+            k/kernel_platform/common/out/arch/arm64/boot/Image
+            k/kernel_platform/common/out/System.map
+            k/kernel_platform/common/out/.config
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            k/apply.log
+            k/kernel_platform/common/build.log
+            /tmp/gki-patches/log
+          if-no-files-found: warn
