@@ -369,6 +369,38 @@ grep -qF 'obj-$(CONFIG_LRNG)'                 "$TREE/drivers/char/Makefile" || d
 ok "LRNG 校验通过（lrng/ 共 $N_LRNG 文件 + include/linux/lrng.h + 两处接线）"
 
 # ===========================================================================
+# PART 2.5：构建兼容性修复 —— gen-hyprel 输出【数字】重定位类型
+#
+#   arch/arm64/kvm/hyp/nvhe/gen-hyprel.c:340 生成：
+#       .reloc <off>, R_AARCH64_PREL32, <sym> + <off>
+#   clang 的集成汇编器（LLVM_IAS=1）只接受数字重定位类型，遇到符号名直接报：
+#       arch/arm64/kvm/hyp/nvhe/hyp-reloc.S:5:11: error: unknown relocation name
+#       make[5]: *** [scripts/Makefile.build:354: .../hyp-reloc.o] Error 1
+#   （实测：2026-10-23 第 2 次构建就栽在这里，LLVM ERROR/Broken pipe 只是它的次生现象）
+#
+#   R_AARCH64_PREL32 == 261（同文件 :56-58 的 #ifndef 兜底定义可证），
+#   改成数字后语义完全等价，链接结果不变。
+#   注意：只改 printf 的格式串，不动 C 代码里的 case R_AARCH64_PREL32。
+# ===========================================================================
+info "PART 2.5 / 构建兼容性修复（gen-hyprel 数字重定位）"
+
+HYPREC="$TREE/arch/arm64/kvm/hyp/nvhe/gen-hyprel.c"
+if [ -f "$HYPREC" ]; then
+  if grep -qF '.reloc %lu, 261, %s%s' "$HYPREC"; then
+    ok "gen-hyprel 已是数字重定位类型，跳过"
+  elif grep -qF '.reloc %lu, R_AARCH64_PREL32, %s%s' "$HYPREC"; then
+    sed -i 's|\.reloc %lu, R_AARCH64_PREL32, %s%s|.reloc %lu, 261, %s%s|' "$HYPREC"
+    ok "gen-hyprel: 已改为数字重定位类型 261（等价 R_AARCH64_PREL32）"
+  else
+    warn "gen-hyprel.c 未匹配到预期格式串（内核版本可能不同），继续"
+  fi
+  grep -qF '.reloc %lu, 261, %s%s' "$HYPREC" || die "gen-hyprel 补丁未生效"
+  ok "gen-hyprel 校验通过"
+else
+  warn "找不到 gen-hyprel.c（本内核可能不使用 nVHE hyp），跳过"
+fi
+
+# ===========================================================================
 # PART 3：功能配置 → common/arch/arm64/configs/gki_defconfig
 # ===========================================================================
 info "PART 3 / 功能配置 → ${CFG#$KP/}"
