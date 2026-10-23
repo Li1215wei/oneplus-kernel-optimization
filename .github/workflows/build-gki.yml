@@ -58,8 +58,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bison flex libssl-dev bc cpio rsync python3 python-is-python3 \
-            lz4 xz-utils zip unzip git curl build-essential libelf-dev dwarves \
-            binutils-aarch64-linux-gnu
+            lz4 xz-utils zip unzip git curl build-essential libelf-dev dwarves
           zip -v | head -2
 
       - name: Checkout workflow repo
@@ -118,14 +117,40 @@ jobs:
           set -euo pipefail
           cd k/kernel_platform/common
 
-          CLANG_BIN="$(cd ../prebuilts-master/clang/host/linux-x86 2>/dev/null && ls -d clang-r*/bin 2>/dev/null | head -1)"
-          if [ -z "${CLANG_BIN:-}" ]; then
-            echo "::error::找不到 prebuilts-master/clang/host/linux-x86/clang-r*/bin"
-            ls -la ../prebuilts-master/clang/host/linux-x86 2>/dev/null || true
+          # ★★ clang 版本必须严格匹配官方 common/build.config.common:7 ★★
+          #    CLANG_PREBUILT_BIN=prebuilts-master/clang/host/linux-x86/clang-r416183b/bin
+          #    clang-r416183b == clang 12.0.x
+          #    原厂内核 CONFIG_CLANG_VERSION=120005（即 r416183b）。
+          #    绝不能猜：目录里还有 clang-r383902（clang 11），字母序恰好在前，
+          #    用错会使 LTO/CFI 的 CLANG_VERSION 依赖不满足 →
+          #      LTO 掉回 CONFIG_LTO_NONE、CONFIG_CFI_CLANG 消失
+          #    → 原厂 CFI 模块（UFS/ext4/f2fs/dm 等，全在 vendor_dlkm/odm_dlkm）
+          #      无法加载 → 卡 logo 反复重启。
+          CLANG_ROOT="$PWD/../prebuilts-master/clang/host/linux-x86"
+          CLANG_BIN=""
+          for cand in clang-r416183b clang-r416183c; do
+            if [ -d "$CLANG_ROOT/$cand/bin" ]; then CLANG_BIN="$cand/bin"; break; fi
+          done
+          if [ -z "$CLANG_BIN" ]; then
+            for d in $(ls -d "$CLANG_ROOT"/clang-r*/bin 2>/dev/null | sort -V -r); do
+              ver=$("$d/clang" -dM -E - </dev/null 2>/dev/null | awk '/__clang_major__/{print $3}')
+              if [ -n "$ver" ] && [ "$ver" -ge 12 ]; then CLANG_BIN="${d#$CLANG_ROOT/}"; break; fi
+            done
+          fi
+          if [ -z "$CLANG_BIN" ]; then
+            echo "::error::找不到 clang-r416183b，也没有 >=12 的 clang"
+            ls -la "$CLANG_ROOT" 2>/dev/null || true
             exit 1
           fi
-          export PATH="$PWD/../prebuilts-master/clang/host/linux-x86/${CLANG_BIN}:$PATH"
-          echo "CLANG: $(command -v clang)"; clang --version | head -2
+          export PATH="$CLANG_ROOT/${CLANG_BIN}:$PATH"
+          echo "CLANG: $(command -v clang)"
+          clang --version | head -3
+          CLANG_MAJOR=$(clang -dM -E - </dev/null | awk '/__clang_major__/{print $3}')
+          echo "CLANG_MAJOR=$CLANG_MAJOR (原厂 12)"
+          if [ "${CLANG_MAJOR:-0}" -lt 12 ]; then
+            echo "::error::clang 大版本 $CLANG_MAJOR < 12，LTO/CFI 会被 Kconfig 静默关掉"
+            exit 1
+          fi
 
           # ★ 必须导出 CROSS_COMPILE：
           #   common/Makefile:589-591
@@ -140,31 +165,20 @@ jobs:
           #   （实测：2026-10-23 那次构建就是栽在这里）
           export ARCH=arm64
           export LLVM=1
-          # ★ 关键：不使用 clang 集成汇编器。
-          #   arch/arm64/kvm/hyp/nvhe/gen-hyprel.c:340 生成的
-          #     .reloc <off>, R_AARCH64_PREL32, <sym> + <off>
-          #   在 LLVM_IAS=1 下会失败（实测两种形态都报错）：
-          #     符号名 → "unknown relocation name"
-          #     数字   → "expected relocation name"
-          #   改用 GNU as（aarch64-linux-gnu-as）后原生支持该语法。
-          export LLVM_IAS=0
+          # 官方 common/build.config.aarch64:3 => LLVM_IAS=1
+          # clang 12 的集成汇编器能汇编 gen-hyprel 生成的
+          #   .reloc <off>, R_AARCH64_PREL32, <sym> + <off>
+          # （此前是 clang 11 的 IAS 不支持，才被迫改用 GNU as —— 根因是 clang 版本）
+          export LLVM_IAS=1
           export CROSS_COMPILE=aarch64-linux-gnu-
-          # 装了 binutils 后 common/Makefile:592 会把 GCC_TOOLCHAIN_DIR 解析成
-          # /usr/bin/，进而 GCC_TOOLCHAIN=/usr 并追加 --gcc-toolchain=/usr；
-          # 而 /usr 下并没有 aarch64 的 GCC 安装（--prefix 已够用）。
-          # 这里把 GCC_TOOLCHAIN 置空，跳过 --gcc-toolchain。
-          export GCC_TOOLCHAIN=
-          # 官方 common/build.config.aarch64:5 也设了 compat 交叉前缀；
-          # gki_defconfig 里 CONFIG_COMPAT=y，vc 兼容层可能用到 32 位工具链
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
           echo "=== 工具链自检 ==="
-          echo "AS  : $(command -v aarch64-linux-gnu-as || echo '❌ 未找到')"
-          aarch64-linux-gnu-as --version | head -1 || true
-          if ! command -v aarch64-linux-gnu-as >/dev/null; then
-            echo "::error::缺少 aarch64-linux-gnu-as（GNU as），无法汇编 hyp-reloc.S"
-            exit 1
-          fi
+          # LTO + CFI 依赖：clang>=12 以及完整的 LLVM 工具
+          for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip; do
+            if ! command -v "$t" >/dev/null; then echo "::error::缺少 $t"; exit 1; fi
+          done
+          echo "LLVM 工具链齐全: ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip"
           clang --target=aarch64-linux-gnu -print-target-triple
           TMPD=$(mktemp -d)
           printf 'register unsigned long sp asm("sp");\nunsigned long f(void){return sp;}\n' > "$TMPD/t.c"
@@ -176,10 +190,9 @@ jobs:
           file "$TMPD/t.o" || true
           echo "✅ 工具链能为 aarch64 生成目标文件"
 
-          MAKE_ARGS=(O=out ARCH=arm64 LLVM=1 LLVM_IAS=0 \
+          MAKE_ARGS=(O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
                      CROSS_COMPILE=aarch64-linux-gnu- \
-                     CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-                     GCC_TOOLCHAIN=)
+                     CROSS_COMPILE_COMPAT=arm-linux-gnueabi-)
 
           echo "=== defconfig ==="
           make "${MAKE_ARGS[@]}" gki_defconfig
@@ -191,6 +204,19 @@ jobs:
             scripts/config --file out/.config -e LTO_CLANG -e LTO_CLANG_FULL -d LTO_CLANG_THIN -d LTO_CLANG_NONE
           fi
           make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo "=== olddefconfig 后校验 LTO/CFI 是否幸存 ==="
+          grep -E '^CONFIG_(LTO_CLANG_THIN|LTO_CLANG_FULL|LTO_NONE|CFI_CLANG)=' out/.config || true
+          if ! grep -qE '^CONFIG_LTO_CLANG_(THIN|FULL)=y' out/.config; then
+            echo "::error::olddefconfig 之后 LTO 没保住（多半是 clang 版本 <12）"
+            grep -E '^CONFIG_CLANG_VERSION=' out/.config || true
+            exit 1
+          fi
+          if ! grep -qx 'CONFIG_CFI_CLANG=y' out/.config; then
+            echo "::error::olddefconfig 之后 CFI_CLANG 丢失（LTO 必须开启且 clang>=12）"
+            exit 1
+          fi
+          echo "OK  LTO + CFI 幸存"
 
           echo "=== 只构建 Image（不构建模块，不需要 vendor 趟）==="
           make -j"$(nproc --all)" "${MAKE_ARGS[@]}" Image 2>&1 | tee build.log
@@ -211,6 +237,42 @@ jobs:
             echo "Image = ${SZ} bytes ($((SZ/1024/1024)) MB)"
           else
             echo "::error::Image 缺失"; FAIL=$((FAIL+1))
+          fi
+
+          echo "=== B0) ★★ CFI / LTO / clang 版本硬校验（原厂模块加载的前提）★★ ==="
+          # 原厂内核实测配置（从出厂 boot.img 提取）：
+          #   CONFIG_CLANG_VERSION=120005  CONFIG_LTO_CLANG_FULL=y
+          #   CONFIG_CFI_CLANG=y           CONFIG_SHADOW_CALL_STACK=y
+          # 若 CFI_CLANG 丢失，kernel/module.c:4535 的
+          #   __cfi_jt_init_module / __cfi_jt_cleanup_module 修正不会执行，
+          #   原厂 CFI 模块（vendor_dlkm/odm_dlkm 里的 UFS/ext4/f2fs/dm 等）
+          #   无法正常加载 → 卡 logo 反复重启。
+          if ! grep -qx 'CONFIG_CFI_CLANG=y' "$CFG"; then
+            echo "::error::CONFIG_CFI_CLANG 不是 y —— 原厂 CFI 模块将无法加载（会卡 logo）"
+            FAIL=$((FAIL+1))
+          else
+            echo "OK  CONFIG_CFI_CLANG=y"
+          fi
+
+          if ! grep -qx 'CONFIG_LTO_CLANG_THIN=y' "$CFG" && ! grep -qx 'CONFIG_LTO_CLANG_FULL=y' "$CFG"; then
+            echo "::error::LTO 未启用（CONFIG_LTO_NONE=y）—— CFI 依赖 LTO，会导致 CFI 消失"
+            FAIL=$((FAIL+1))
+          else
+            grep -E '^CONFIG_LTO_CLANG_(THIN|FULL)=y' "$CFG" | sed 's/^/OK  /'
+          fi
+
+          for c in SHADOW_CALL_STACK KASAN VIRTUALIZATION KVM; do
+            if ! grep -qx "CONFIG_${c}=y" "$CFG"; then
+              echo "::error::CONFIG_${c} 不是 y（原厂为 y）"
+              FAIL=$((FAIL+1))
+            fi
+          done
+
+          CV=$(grep -m1 '^CONFIG_CLANG_VERSION=' "$CFG" | cut -d= -f2)
+          echo "CONFIG_CLANG_VERSION=$CV (原厂 120005)"
+          if [ -z "${CV:-}" ] || [ "$CV" -lt 120000 ]; then
+            echo "::error::clang 版本 $CV < 120000，会静默丢失 LTO/CFI"
+            FAIL=$((FAIL+1))
           fi
 
           echo "=== B) ★ CRC 安全校验（决定能否只刷 boot）★ ==="
