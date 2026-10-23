@@ -141,6 +141,9 @@ jobs:
           export LLVM=1
           export LLVM_IAS=1
           export CROSS_COMPILE=aarch64-linux-gnu-
+          # 官方 common/build.config.aarch64:5 也设了 compat 交叉前缀；
+          # gki_defconfig 里 CONFIG_COMPAT=y，vc 兼容层可能用到 32 位工具链
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
           echo "=== 工具链自检 ==="
           clang --target=aarch64-linux-gnu -print-target-triple
@@ -154,7 +157,9 @@ jobs:
           file "$TMPD/t.o" || true
           echo "✅ 工具链能为 aarch64 生成目标文件"
 
-          MAKE_ARGS=(O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-)
+          MAKE_ARGS=(O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+                     CROSS_COMPILE=aarch64-linux-gnu- \
+                     CROSS_COMPILE_COMPAT=arm-linux-gnueabi-)
 
           echo "=== defconfig ==="
           make "${MAKE_ARGS[@]}" gki_defconfig
