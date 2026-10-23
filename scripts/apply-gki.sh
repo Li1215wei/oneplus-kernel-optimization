@@ -374,16 +374,14 @@ ok "LRNG 校验通过（lrng/ 共 $N_LRNG 文件 + include/linux/lrng.h + 两处
 #   arch/arm64/kvm/hyp/nvhe/gen-hyprel.c:340 生成：
 #       .reloc <off>, R_AARCH64_PREL32, <sym> + <off>
 #
-#   实测两次构建（2026-10-23）：
-#     · 原样（符号名）→ clang IAS: "unknown relocation name"
-#     · 改数字 261    → clang IAS: "expected relocation name"
-#   说明本环境 clang 的集成汇编器（LLVM_IAS=1）无法汇编这种 .reloc 形式
-#   （它要求标识符，但名字表里没有 PREL32；给数字又要求标识符）。
-#
-#   ⇒ 解决办法不在内核源码侧，而是【改用 GNU as】：
-#      workflow 中不再传 LLVM_IAS=1，clang 走 -fno-integrated-as，
-#      由 aarch64-linux-gnu-as 汇编；GNU as 原生支持
-#      .reloc offset, R_AARCH64_PREL32, symbol+addend。
+#   历史排查（2026-10-23）：
+#     · 符号名 → "unknown relocation name"
+#     · 数字 261 → "expected relocation name"
+#   当时的真凶其实是【clang 版本选错】：workflow 用 ls|head -1 猜到了
+#   clang-r383902（clang 11），它的集成汇编器不支持该 .reloc 形式，
+#   同时也导致 LTO/CFI 被 Kconfig 静默关闭（那才是卡 logo 的根因）。
+#   修正为官方 clang-r416183b（clang 12）后，LLVM_IAS=1 可正常汇编此文件，
+#   与原厂内核构建方式一致（原厂 CONFIG_CLANG_VERSION=120005）。
 #
 #   因此这里只做一件事：确保源码是上游符号名形态（防止历史补丁残留）。
 # ===========================================================================
@@ -448,6 +446,22 @@ for c in $MUST_NOT_Y; do
   fi
 done
 ok "CRC 敏感项全部符合要求（10 项）、KASAN=y"
+
+# ---- CFI / LTO 守护 ------------------------------------------------------
+# 原厂内核（从出厂 boot.img 提取）为：
+#   CONFIG_CLANG_VERSION=120005  CONFIG_LTO_CLANG_FULL=y
+#   CONFIG_CFI_CLANG=y           CONFIG_SHADOW_CALL_STACK=y
+# CFI_CLANG 丢失时 kernel/module.c:4535 的
+#   __cfi_jt_init_module / __cfi_jt_cleanup_module 修正不会执行，
+#   原厂 CFI 模块无法加载 → 卡 logo 重启。这里守住 defconfig 里的这三项，
+#   运行期的 CLANG_VERSION/LTO 由 workflow 在 olddefconfig 后复查。
+for c in CFI_CLANG SHADOW_CALL_STACK LTO_CLANG_FULL VIRTUALIZATION KVM; do
+  if grep -qx "CONFIG_${c}=y" "$CFG"; then
+    ok "CONFIG_${c}=y（与原厂一致）"
+  else
+    die "CONFIG_${c} 必须在 gki_defconfig 中为 y（原厂为 y，缺失会导致 LTO/CFI 链路断裂）"
+  fi
+done
 
 # 记录基线，供 CI 复核
 {
